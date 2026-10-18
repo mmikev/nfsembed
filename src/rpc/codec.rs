@@ -171,6 +171,11 @@ impl Encoder {
         self.output.is_empty()
     }
 
+    /// Discards everything written after the first `length` bytes.
+    pub fn truncate(&mut self, length: usize) {
+        self.output.truncate(length);
+    }
+
     pub fn write_u64(&mut self, value: u64) {
         self.output.extend_from_slice(&value.to_be_bytes());
     }
@@ -247,6 +252,71 @@ mod tests {
         let mut decoder = Decoder::new(&bytes);
         assert_eq!(decoder.read_opaque("value", 3).unwrap(), b"abc");
         decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn opaque_padding_must_be_zero_and_is_written_as_zero() {
+        let mut encoder = Encoder::new();
+        encoder.write_opaque(b"a").unwrap();
+        let bytes = encoder.into_bytes();
+        assert_eq!(bytes, [0, 0, 0, 1, b'a', 0, 0, 0]);
+
+        let mut bad_padding = bytes.clone();
+        bad_padding[7] = 1;
+        assert_eq!(Decoder::new(&bad_padding).read_opaque("value", 8), Err(DecodeError::InvalidPadding));
+        assert_eq!(Decoder::new(&bytes[..6]).read_opaque("value", 8), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn arrays_enforce_their_limit_and_finish_rejects_trailing_bytes() {
+        let mut encoder = Encoder::new();
+        encoder.write_u32(2);
+        encoder.write_u32(10);
+        encoder.write_u32(20);
+        encoder.write_u32(99);
+        let bytes = encoder.into_bytes();
+
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.read_array("values", 2, Decoder::read_u32).unwrap(), [10, 20]);
+        assert_eq!(decoder.remaining(), 4);
+        assert_eq!(decoder.finish(), Err(DecodeError::TrailingBytes));
+
+        assert_eq!(
+            Decoder::new(&bytes).read_array("values", 1, Decoder::read_u32),
+            Err(DecodeError::LimitExceeded {
+                field: "values",
+                actual: 2,
+                limit: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn fixed_width_values_round_trip_and_reject_truncation() {
+        let mut encoder = Encoder::with_capacity(32);
+        encoder.write_u64(u64::MAX - 1);
+        encoder.write_bool(true);
+        encoder.write_fixed(&[1, 2, 3, 4]);
+        encoder.write_u32(i32::MIN as u32);
+        assert_eq!(encoder.len(), 20);
+        let bytes = encoder.into_bytes();
+
+        let mut decoder = Decoder::new(&bytes);
+        assert_eq!(decoder.read_u64(), Ok(u64::MAX - 1));
+        assert_eq!(decoder.read_bool(), Ok(true));
+        assert_eq!(decoder.read_fixed::<4>(), Ok([1, 2, 3, 4]));
+        assert_eq!(decoder.read_i32(), Ok(i32::MIN));
+        assert_eq!(decoder.position(), 20);
+        assert_eq!(decoder.read_u32(), Err(DecodeError::Truncated));
+        decoder.finish().unwrap();
+        assert_eq!(
+            Decoder::new(&[0; 3]).read_enum("kind", |value| (value == 0).then_some(())),
+            Err(DecodeError::Truncated)
+        );
+        assert_eq!(
+            Decoder::new(&[0, 0, 0, 7]).read_enum("kind", |value| (value == 0).then_some(())),
+            Err(DecodeError::InvalidDiscriminant { kind: "kind", value: 7 })
+        );
     }
 
     #[test]

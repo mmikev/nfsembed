@@ -65,13 +65,9 @@ async fn tracing_contains_stable_operational_fields_without_sensitive_payloads()
     assert_eq!(decoder.read_u32().unwrap(), 0);
     let file = decoder.read_opaque("file handle", 64).unwrap();
 
-    let _ = client
-        .call_with_xid(900, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&file))
-        .await;
-    let _ = client
-        .call_with_xid(900, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&file))
-        .await;
+    let _ = client.call(NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&file)).await;
 
+    // A retransmitted mutation is answered from the replay cache.
     const SECRET: &[u8] = b"never-log-this-file-content";
     let mut write = Encoder::new();
     write.write_opaque(&file).unwrap();
@@ -79,7 +75,9 @@ async fn tracing_contains_stable_operational_fields_without_sensitive_payloads()
     write.write_u32(SECRET.len() as u32);
     write.write_u32(0);
     write.write_opaque(SECRET).unwrap();
-    let _ = client.call(NFS_PROGRAM, NFS_VERSION, 7, &write.into_bytes()).await;
+    let write = write.into_bytes();
+    let _ = client.call_with_xid(900, NFS_PROGRAM, NFS_VERSION, 7, &write).await;
+    let _ = client.call_with_xid(900, NFS_PROGRAM, NFS_VERSION, 7, &write).await;
 
     server.shutdown().await;
 

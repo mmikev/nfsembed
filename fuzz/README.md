@@ -1,7 +1,9 @@
 # Fuzz targets
 
 The cargo-fuzz package exercises the network-controlled codec, authentication,
-record-fragmentation, and authenticated-handle surfaces.
+record-fragmentation, and authenticated-handle surfaces, the production WRITE
+argument validation and READDIR/READDIRPLUS reply encoder, and replay-cache
+state transitions.
 
 Run bounded smoke sessions locally:
 

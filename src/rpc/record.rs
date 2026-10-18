@@ -27,111 +27,85 @@ pub enum RecordError {
     BudgetClosed,
 }
 
+const LAST_FRAGMENT: u32 = 0x8000_0000;
+const MAX_WIRE_FRAGMENT_SIZE: usize = 0x7fff_ffff;
+
 pub async fn read_record<R: AsyncRead + Unpin>(reader: &mut R, limits: RecordLimits) -> Result<Vec<u8>, RecordError> {
-    let mut record = Vec::new();
-    for fragment_index in 0..limits.max_fragments {
-        let header = reader.read_u32().await?;
-        let last = header & 0x8000_0000 != 0;
-        let length = (header & 0x7fff_ffff) as usize;
-        if length == 0 && !last {
-            return Err(RecordError::EmptyFragment);
-        }
-        if length > limits.max_fragment_size {
-            return Err(RecordError::FragmentTooLarge {
-                actual: length,
-                limit: limits.max_fragment_size,
-            });
-        }
-        let new_length = record.len().checked_add(length).ok_or(RecordError::RecordTooLarge {
-            limit: limits.max_record_size,
-        })?;
-        if new_length > limits.max_record_size {
-            return Err(RecordError::RecordTooLarge {
-                limit: limits.max_record_size,
-            });
-        }
-        reserve_record(&mut record, new_length, limits.max_record_size)?;
-        let start = record.len();
-        record.resize(new_length, 0);
-        reader.read_exact(&mut record[start..]).await?;
-        if last {
-            return Ok(record);
-        }
-        if fragment_index + 1 == limits.max_fragments {
-            return Err(RecordError::TooManyFragments {
-                limit: limits.max_fragments,
-            });
-        }
-    }
-    Err(RecordError::TooManyFragments {
-        limit: limits.max_fragments,
-    })
+    let header = reader.read_u32().await?;
+    read_fragments(reader, header, limits).await
 }
 
-/// Reads a record while reserving its maximum aggregate byte budget before
-/// the first fragment body is allocated. A whole-record reservation avoids
-/// fragmented readers holding partial reservations while waiting on each
-/// other. The returned permit keeps the record charged while it is queued or
-/// executing.
+/// Reads a record while charging its byte budget before any fragment body is
+/// allocated. The returned permit keeps the record charged while it is queued
+/// or executing.
+///
+/// A single-fragment record (the common case) has a known final size and
+/// reserves exactly that size. A fragmented record reserves the maximum record
+/// size up front: a whole-record reservation prevents fragmented readers from
+/// holding partial reservations while waiting on each other.
 pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
     reader: &mut R,
     limits: RecordLimits,
     budget: Arc<Semaphore>,
 ) -> Result<(Vec<u8>, OwnedSemaphorePermit), RecordError> {
-    let mut record = Vec::new();
-    let mut header = reader.read_u32().await?;
-    let first_length = (header & 0x7fff_ffff) as usize;
-    if first_length == 0 && header & 0x8000_0000 == 0 {
+    let header = reader.read_u32().await?;
+    let first_length = fragment_length(header, limits, 0)?;
+    let reservation = if header & LAST_FRAGMENT != 0 {
+        first_length
+    } else {
+        limits.max_record_size
+    };
+    let reservation = u32::try_from(reservation).map_err(|_| RecordError::RecordTooLarge {
+        limit: u32::MAX as usize,
+    })?;
+    let permit = budget
+        .acquire_many_owned(reservation)
+        .await
+        .map_err(|_| RecordError::BudgetClosed)?;
+    let record = read_fragments(reader, header, limits).await?;
+    Ok((record, permit))
+}
+
+/// Validates one fragment header against the per-fragment limit and the
+/// record bytes already received, returning the fragment body length.
+fn fragment_length(header: u32, limits: RecordLimits, received: usize) -> Result<usize, RecordError> {
+    let length = (header & !LAST_FRAGMENT) as usize;
+    if length == 0 && header & LAST_FRAGMENT == 0 {
         return Err(RecordError::EmptyFragment);
     }
-    if first_length > limits.max_fragment_size {
+    if length > limits.max_fragment_size {
         return Err(RecordError::FragmentTooLarge {
-            actual: first_length,
+            actual: length,
             limit: limits.max_fragment_size,
         });
     }
-    if first_length > limits.max_record_size {
+    if received.checked_add(length).is_none_or(|total| total > limits.max_record_size) {
         return Err(RecordError::RecordTooLarge {
             limit: limits.max_record_size,
         });
     }
-    let reservation = budget
-        .acquire_many_owned(u32::try_from(limits.max_record_size).map_err(|_| RecordError::RecordTooLarge {
-            limit: u32::MAX as usize,
-        })?)
-        .await
-        .map_err(|_| RecordError::BudgetClosed)?;
+    Ok(length)
+}
+
+/// Reads the fragment bodies of one record, starting from an already-read
+/// first fragment header.
+async fn read_fragments<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    mut header: u32,
+    limits: RecordLimits,
+) -> Result<Vec<u8>, RecordError> {
+    let mut record = Vec::new();
     for fragment_index in 0..limits.max_fragments {
-        let last = header & 0x8000_0000 != 0;
-        let length = (header & 0x7fff_ffff) as usize;
-        if length == 0 && !last {
-            return Err(RecordError::EmptyFragment);
-        }
-        if length > limits.max_fragment_size {
-            return Err(RecordError::FragmentTooLarge {
-                actual: length,
-                limit: limits.max_fragment_size,
-            });
-        }
-        let new_length = record.len().checked_add(length).ok_or(RecordError::RecordTooLarge {
-            limit: limits.max_record_size,
-        })?;
-        if new_length > limits.max_record_size {
-            return Err(RecordError::RecordTooLarge {
-                limit: limits.max_record_size,
-            });
-        }
-        reserve_record(&mut record, new_length, limits.max_record_size)?;
+        let length = fragment_length(header, limits, record.len())?;
         let start = record.len();
-        record.resize(new_length, 0);
+        reserve_record(&mut record, start + length, limits.max_record_size)?;
+        record.resize(start + length, 0);
         reader.read_exact(&mut record[start..]).await?;
-        if last {
-            return Ok((record, reservation));
+        if header & LAST_FRAGMENT != 0 {
+            return Ok(record);
         }
         if fragment_index + 1 == limits.max_fragments {
-            return Err(RecordError::TooManyFragments {
-                limit: limits.max_fragments,
-            });
+            break;
         }
         header = reader.read_u32().await?;
     }
@@ -177,8 +151,7 @@ pub async fn write_record_limited<W: AsyncWrite + Unpin>(
     record: &[u8],
     limits: RecordLimits,
 ) -> Result<(), RecordError> {
-    validate_record(record, limits)?;
-    write_fragments(writer, record, limits.max_fragment_size).await
+    write_record_segments_limited(writer, [record, &[], &[]], limits).await
 }
 
 /// Writes a record held in up to three immutable segments without first
@@ -197,12 +170,8 @@ pub async fn write_record_segments_limited<W: AsyncWrite + Unpin>(
     write_segmented_fragments(writer, segments, length, limits.max_fragment_size).await
 }
 
-pub fn validate_record(record: &[u8], limits: RecordLimits) -> Result<(), RecordError> {
-    validate_record_length(record.len(), limits)
-}
-
-/// Validates an outbound record when its payload is segmented and therefore
-/// has no single contiguous slice.
+/// Validates the length of an outbound record against the aggregate size,
+/// fragment-size, and fragment-count limits.
 pub fn validate_record_length(length: usize, limits: RecordLimits) -> Result<(), RecordError> {
     if length > limits.max_record_size {
         return Err(RecordError::RecordTooLarge {
@@ -237,63 +206,48 @@ async fn write_segmented_fragments<W: AsyncWrite + Unpin>(
     max_fragment_size: usize,
 ) -> Result<(), RecordError> {
     if total_length == 0 {
-        writer.write_all(&0x8000_0000u32.to_be_bytes()).await?;
+        writer.write_all(&LAST_FRAGMENT.to_be_bytes()).await?;
+        writer.flush().await?;
         return Ok(());
     }
+    // Persistent cursor into `segments`; it advances by exactly the payload
+    // bytes of each fragment. Record-marking headers are not counted.
     let mut segment_index = 0usize;
     let mut segment_offset = 0usize;
     let mut remaining_total = total_length;
     while remaining_total > 0 {
         let fragment_length = remaining_total.min(max_fragment_size);
-        if fragment_length > 0x7fff_ffff {
+        if fragment_length > MAX_WIRE_FRAGMENT_SIZE {
             return Err(RecordError::FragmentTooLarge {
                 actual: fragment_length,
-                limit: 0x7fff_ffff,
+                limit: MAX_WIRE_FRAGMENT_SIZE,
             });
         }
         let last = fragment_length == remaining_total;
-        let header = (fragment_length as u32 | if last { 0x8000_0000 } else { 0 }).to_be_bytes();
+        let header = (fragment_length as u32 | if last { LAST_FRAGMENT } else { 0 }).to_be_bytes();
         let mut slices = [IoSlice::new(&[]); 4];
         slices[0] = IoSlice::new(&header);
         let mut slice_count = 1usize;
-        let mut current_index = segment_index;
-        let mut current_offset = segment_offset;
         let mut remaining_fragment = fragment_length;
         while remaining_fragment > 0 {
-            while current_index < segments.len() && current_offset == segments[current_index].len() {
-                current_index += 1;
-                current_offset = 0;
+            while segment_index < segments.len() && segment_offset == segments[segment_index].len() {
+                segment_index += 1;
+                segment_offset = 0;
             }
             let segment = segments
-                .get(current_index)
+                .get(segment_index)
                 .ok_or(RecordError::RecordTooLarge { limit: total_length })?;
-            let take = remaining_fragment.min(segment.len() - current_offset);
-            slices[slice_count] = IoSlice::new(&segment[current_offset..current_offset + take]);
+            let take = remaining_fragment.min(segment.len() - segment_offset);
+            slices[slice_count] = IoSlice::new(&segment[segment_offset..segment_offset + take]);
             slice_count += 1;
             remaining_fragment -= take;
-            current_offset += take;
+            segment_offset += take;
         }
         write_all_slices(writer, &mut slices[..slice_count]).await?;
-        advance_segments(&segments, &mut segment_index, &mut segment_offset, fragment_length);
         remaining_total -= fragment_length;
     }
     writer.flush().await?;
     Ok(())
-}
-
-fn advance_segments(segments: &[&[u8]], index: &mut usize, offset: &mut usize, mut count: usize) {
-    // Advance the persistent cursor by exactly the payload bytes written for
-    // one fragment. The record-marking header is intentionally not counted.
-    while count > 0 {
-        while *index < segments.len() && *offset == segments[*index].len() {
-            *index += 1;
-            *offset = 0;
-        }
-        let available = segments[*index].len() - *offset;
-        let take = available.min(count);
-        *offset += take;
-        count -= take;
-    }
 }
 
 async fn write_all_slices<W: AsyncWrite + Unpin>(
@@ -316,43 +270,6 @@ async fn write_all_slices<W: AsyncWrite + Unpin>(
             writer.write_all(slice).await?;
         }
     }
-    Ok(())
-}
-
-async fn write_fragments<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    record: &[u8],
-    max_fragment_size: usize,
-) -> Result<(), RecordError> {
-    if max_fragment_size == 0 {
-        return Err(RecordError::FragmentTooLarge {
-            actual: record.len(),
-            limit: 0,
-        });
-    }
-    if record.is_empty() {
-        writer.write_all(&0x8000_0000u32.to_be_bytes()).await?;
-        return Ok(());
-    }
-    let mut fragments = record.chunks(max_fragment_size).peekable();
-    while let Some(fragment) = fragments.next() {
-        let end = fragments.peek().is_none();
-        if fragment.len() > 0x7fff_ffff {
-            return Err(RecordError::FragmentTooLarge {
-                actual: fragment.len(),
-                limit: 0x7fff_ffff,
-            });
-        }
-        let length = u32::try_from(fragment.len()).map_err(|_| RecordError::FragmentTooLarge {
-            actual: fragment.len(),
-            limit: 0x7fff_ffff,
-        })?;
-        let header = length | if end { 0x8000_0000 } else { 0 };
-        let header = header.to_be_bytes();
-        let mut slices = [IoSlice::new(&header), IoSlice::new(fragment)];
-        write_all_slices(writer, &mut slices).await?;
-    }
-    writer.flush().await?;
     Ok(())
 }
 
@@ -526,6 +443,93 @@ mod tests {
         assert_eq!(second_record, b"ijklmnop");
         drop(second_reservation);
         assert_eq!(budget.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn single_fragment_records_reserve_only_their_length() {
+        let limits = RecordLimits {
+            max_record_size: 64,
+            max_fragment_size: 64,
+            max_fragments: 4,
+        };
+        let budget = Arc::new(Semaphore::new(100));
+        let (mut client, mut server) = tokio::io::duplex(128);
+        client.write_all(&0x8000_0008u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"abcdefgh").await.unwrap();
+        let (record, permit) = read_record_budgeted(&mut server, limits, budget.clone()).await.unwrap();
+        assert_eq!(record, b"abcdefgh");
+        assert_eq!(budget.available_permits(), 92);
+        drop(permit);
+        assert_eq!(budget.available_permits(), 100);
+
+        client.write_all(&4u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"ijkl").await.unwrap();
+        client.write_all(&0x8000_0004u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"mnop").await.unwrap();
+        let (record, permit) = read_record_budgeted(&mut server, limits, budget.clone()).await.unwrap();
+        assert_eq!(record, b"ijklmnop");
+        assert_eq!(budget.available_permits(), 100 - 64, "fragmented records reserve the record limit");
+        drop(permit);
+    }
+
+    #[tokio::test]
+    async fn invalid_first_header_is_rejected_without_waiting_for_budget() {
+        async fn rejected(header: u32) -> RecordError {
+            let limits = RecordLimits {
+                max_record_size: 64,
+                max_fragment_size: 32,
+                max_fragments: 4,
+            };
+            let (mut client, mut server) = tokio::io::duplex(16);
+            client.write_all(&header.to_be_bytes()).await.unwrap();
+            let exhausted = Arc::new(Semaphore::new(0));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                read_record_budgeted(&mut server, limits, exhausted),
+            )
+            .await
+            .expect("an invalid header must not wait for budget")
+            .unwrap_err()
+        }
+
+        assert!(matches!(rejected(0x8000_0021).await, RecordError::FragmentTooLarge { actual: 33, limit: 32 }));
+        assert!(matches!(rejected(0).await, RecordError::EmptyFragment));
+    }
+
+    #[tokio::test]
+    async fn empty_records_and_empty_final_fragments_round_trip() {
+        let limits = RecordLimits {
+            max_record_size: 16,
+            max_fragment_size: 16,
+            max_fragments: 2,
+        };
+        let (mut client, mut server) = tokio::io::duplex(64);
+        write_record(&mut client, b"", 16).await.unwrap();
+        assert!(read_record(&mut server, limits).await.unwrap().is_empty());
+
+        client.write_all(&2u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"ab").await.unwrap();
+        client.write_all(&0x8000_0000u32.to_be_bytes()).await.unwrap();
+        assert_eq!(read_record(&mut server, limits).await.unwrap(), b"ab");
+    }
+
+    #[tokio::test]
+    async fn record_size_limit_spans_fragments() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        client.write_all(&4u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"abcd").await.unwrap();
+        client.write_all(&0x8000_0004u32.to_be_bytes()).await.unwrap();
+        let error = read_record(
+            &mut server,
+            RecordLimits {
+                max_record_size: 6,
+                max_fragment_size: 4,
+                max_fragments: 4,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(error, RecordError::RecordTooLarge { limit: 6 }));
     }
 
     #[tokio::test]

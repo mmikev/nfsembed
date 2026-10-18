@@ -207,6 +207,31 @@ mod tests {
     }
 
     #[test]
+    fn equality_compares_wire_bytes_regardless_of_segmentation() {
+        let segmented = EncodedReply::segmented(Bytes::from_static(b"ab"), Bytes::from_static(b"cd"), 0);
+        let other_split = EncodedReply::segmented(Bytes::from_static(b"a"), Bytes::from_static(b"bcd"), 0);
+        assert_eq!(segmented, other_split);
+        assert_eq!(segmented, Bytes::from_static(b"abcd"));
+        assert_ne!(segmented, Bytes::from_static(b"abce"));
+        assert_ne!(segmented, EncodedReply::segmented(Bytes::from_static(b"ab"), Bytes::from_static(b"cd"), 1));
+        assert_eq!(segmented.prefix(), b"ab");
+        assert!(!segmented.is_empty());
+        assert!(EncodedReply::from(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn unknown_bytes_owners_are_compacted_for_replay_retention() {
+        let large = Bytes::from(vec![7; 4096]);
+        let reply = EncodedReply::from(large.slice(..16));
+        assert!(reply.replay_storage_requires_copy());
+        let (cached, retained_bytes) = reply.replay_storage();
+        assert_eq!(cached, reply);
+        assert!(!cached.replay_storage_requires_copy());
+        assert!((16..4096).contains(&retained_bytes), "a slice must not charge or pin its parent allocation");
+        assert_ne!(cached.segments()[0].as_ptr(), large.as_ptr());
+    }
+
+    #[test]
     fn vec_backing_capacity_is_charged_without_copying() {
         let mut value = Vec::with_capacity(1024);
         value.extend_from_slice(b"data");

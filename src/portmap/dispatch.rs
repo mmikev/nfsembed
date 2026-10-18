@@ -14,6 +14,20 @@ pub fn get_port(request: &mapping, nfs_port: u16, mount_port: u16) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::codec::{DecodeError, Encoder};
+
+    #[test]
+    fn getport_arguments_decode_exactly() {
+        let mut arguments = Encoder::new();
+        for value in [100_003, 3, super::IPPROTO_TCP, 0] {
+            arguments.write_u32(value);
+        }
+        let arguments = arguments.into_bytes();
+        let request = mapping::decode(&arguments).unwrap();
+        assert_eq!((request.prog, request.vers, request.prot, request.port), (100_003, 3, 6, 0));
+        assert_eq!(mapping::decode(&arguments[..12]).unwrap_err(), DecodeError::Truncated);
+        assert_eq!(mapping::decode(&[arguments.as_slice(), &[0; 4]].concat()).unwrap_err(), DecodeError::TrailingBytes);
+    }
 
     #[test]
     fn only_exact_tcp_nfs_and_mount_v3_mappings_are_advertised() {

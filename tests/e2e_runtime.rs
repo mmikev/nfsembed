@@ -7,9 +7,9 @@ use nfsembed::rpc::codec::{Decoder, Encoder};
 use nfsembed::server::{AuthPolicy, NfsServer, PortmapperMode, PortmapperSockets, ServerLimits};
 use nfsembed::vfs::ExportId;
 use support::rpc::{
-    assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_payload,
-    parse_reply, record_header, rpc_call, start_built_server, start_server, start_server_with, Auth, RpcClient,
-    RpcOutcome, MOUNT_PROGRAM, MOUNT_VERSION, NFS_PROGRAM, NFS_VERSION, PORTMAP_PROGRAM, PORTMAP_VERSION,
+    assert_nfs_status, encode_empty_set_attributes, mount_root, nfs_args_directory, nfs_args_handle, nfs_args_setattr,
+    nfs_payload, parse_reply, record_header, rpc_call, start_built_server, start_server, start_server_with, Auth,
+    RpcClient, RpcOutcome, MOUNT_PROGRAM, MOUNT_VERSION, NFS_PROGRAM, NFS_VERSION, PORTMAP_PROGRAM, PORTMAP_VERSION,
 };
 use support::vfs::ConformanceVfs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -304,9 +304,9 @@ async fn auth_sys_stamp_changes_do_not_bypass_completed_replay() {
     let server = start_server(vfs.clone()).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
-    let baseline = vfs.call_count("getattr");
+    let baseline = vfs.call_count("setattr");
     let first = client
-        .call_with_xid(910, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(910, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
 
     let mut credential = support::rpc::auth_sys_body();
@@ -316,10 +316,51 @@ async fn auth_sys_stamp_changes_do_not_bypass_completed_replay() {
         body: credential,
     });
     let replay = client
-        .call_with_xid(910, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(910, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     assert_eq!(first, replay);
-    assert_eq!(vfs.call_count("getattr"), baseline + 1);
+    assert_eq!(vfs.call_count("setattr"), baseline + 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn idempotent_retransmissions_are_executed_again_instead_of_cached() {
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    vfs.set_data(vec![0x5a; 4096]);
+    let server = start_server(vfs.clone()).await;
+    let mut client = RpcClient::connect(server.address).await;
+    let root = mount_root(&mut client, b"/").await;
+    let file = lookup_handle(&mut client, &root, b"file").await;
+    let mut read = Encoder::new();
+    read.write_opaque(&file).unwrap();
+    read.write_u64(0);
+    read.write_u32(4096);
+    let read = read.into_bytes();
+
+    for (procedure, operation, arguments) in [
+        (1, "getattr", nfs_args_handle(&root)),
+        (3, "lookup", nfs_args_directory(&root, b"file")),
+        (6, "read", read),
+    ] {
+        let baseline = vfs.call_count(operation);
+        let first = client
+            .call_with_xid(700 + procedure, NFS_PROGRAM, NFS_VERSION, procedure, &arguments)
+            .await;
+        let retransmitted = client
+            .call_with_xid(700 + procedure, NFS_PROGRAM, NFS_VERSION, procedure, &arguments)
+            .await;
+        assert_eq!(first, retransmitted, "{operation} results differ");
+        assert_eq!(vfs.call_count(operation), baseline + 2, "{operation} was not executed again");
+    }
+
+    // A mutation with the same XID is still answered from the cache.
+    let baseline = vfs.call_count("setattr");
+    for _ in 0..2 {
+        let _ = client
+            .call_with_xid(710, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
+            .await;
+    }
+    assert_eq!(vfs.call_count("setattr"), baseline + 1);
     server.shutdown().await;
 }
 
@@ -624,56 +665,56 @@ async fn completed_inflight_lost_reply_and_xid_reuse_paths_are_end_to_end_correc
     let root = mount_root(&mut first, b"/").await;
     let file = lookup_handle(&mut first, &root, b"file").await;
 
-    let baseline = vfs.call_count("getattr");
+    let baseline = vfs.call_count("setattr");
     let reply1 = first
-        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     let reply2 = first
-        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     assert_eq!(reply1, reply2);
-    assert_eq!(vfs.call_count("getattr"), baseline + 1);
+    assert_eq!(vfs.call_count("setattr"), baseline + 1);
 
     let _reused = first
-        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&file))
+        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&file))
         .await;
-    assert_eq!(vfs.call_count("getattr"), baseline + 2, "different arguments must be XID reuse");
+    assert_eq!(vfs.call_count("setattr"), baseline + 2, "different arguments must be XID reuse");
     let _reused_again = first
-        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(500, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
-    assert_eq!(vfs.call_count("getattr"), baseline + 3, "A-B-A XID reuse replayed stale A");
+    assert_eq!(vfs.call_count("setattr"), baseline + 3, "A-B-A XID reuse replayed stale A");
 
-    let lost_baseline = vfs.call_count("getattr");
+    let lost_baseline = vfs.call_count("setattr");
     first
-        .send_without_reading(501, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .send_without_reading(501, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     drop(first);
     for _ in 0..50 {
-        if vfs.call_count("getattr") == lost_baseline + 1 {
+        if vfs.call_count("setattr") == lost_baseline + 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(vfs.call_count("getattr"), lost_baseline + 1);
+    assert_eq!(vfs.call_count("setattr"), lost_baseline + 1);
     let mut reconnected = RpcClient::connect(server.address).await;
     let replayed = reconnected
-        .call_with_xid(501, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(501, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
-    assert_eq!(assert_nfs_status(replayed, 0).len(), 88);
-    assert_eq!(vfs.call_count("getattr"), lost_baseline + 1, "lost reply was not replayed");
+    assert_nfs_status(replayed, 0);
+    assert_eq!(vfs.call_count("setattr"), lost_baseline + 1, "lost reply was not replayed");
 
     let mut other = RpcClient::connect(server.address).await;
-    vfs.delay("getattr", Duration::from_millis(100));
+    vfs.delay("setattr", Duration::from_millis(100));
     vfs.reset_concurrency_observation();
-    let inflight_baseline = vfs.call_count("getattr");
-    let args1 = nfs_args_handle(&root);
+    let inflight_baseline = vfs.call_count("setattr");
+    let args1 = nfs_args_setattr(&root);
     let args2 = args1.clone();
     let (first_reply, second_reply) = tokio::join!(
-        reconnected.call_with_xid(502, NFS_PROGRAM, NFS_VERSION, 1, &args1),
-        other.call_with_xid(502, NFS_PROGRAM, NFS_VERSION, 1, &args2),
+        reconnected.call_with_xid(502, NFS_PROGRAM, NFS_VERSION, 2, &args1),
+        other.call_with_xid(502, NFS_PROGRAM, NFS_VERSION, 2, &args2),
     );
     assert_eq!(first_reply, second_reply);
-    assert_eq!(vfs.call_count("getattr"), inflight_baseline + 1);
+    assert_eq!(vfs.call_count("setattr"), inflight_baseline + 1);
 
     server.shutdown().await;
 }
@@ -687,24 +728,28 @@ async fn replay_ttl_and_capacity_bound_completed_entries() {
     let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
-    let baseline = vfs.call_count("getattr");
+    let baseline = vfs.call_count("setattr");
 
     let _ = client
-        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     let _ = client
-        .call_with_xid(551, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(551, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
     let _ = client
-        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
-    assert_eq!(vfs.call_count("getattr"), baseline + 3, "capacity did not evict the oldest reply");
+    assert_eq!(vfs.call_count("setattr"), baseline + 3, "capacity did not evict the oldest reply");
 
+    let _ = client
+        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
+        .await;
+    assert_eq!(vfs.call_count("setattr"), baseline + 3, "the retained reply was not replayed");
     tokio::time::sleep(Duration::from_millis(60)).await;
     let _ = client
-        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+        .call_with_xid(550, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
         .await;
-    assert_eq!(vfs.call_count("getattr"), baseline + 4, "TTL did not expire the cached reply");
+    assert_eq!(vfs.call_count("setattr"), baseline + 4, "TTL did not expire the cached reply");
 
     server.shutdown().await;
 }
@@ -717,16 +762,16 @@ async fn replay_byte_budget_skips_replies_that_cannot_fit() {
     let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
     let mut client = RpcClient::connect(server.address).await;
     let root = mount_root(&mut client, b"/").await;
-    let baseline = vfs.call_count("getattr");
+    let baseline = vfs.call_count("setattr");
     for _ in 0..2 {
         let payload = nfs_payload(
             client
-                .call_with_xid(555, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&root))
+                .call_with_xid(555, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&root))
                 .await,
         );
         assert_eq!(u32::from_be_bytes(payload[..4].try_into().unwrap()), 0);
     }
-    assert_eq!(vfs.call_count("getattr"), baseline + 2);
+    assert_eq!(vfs.call_count("setattr"), baseline + 2);
     server.shutdown().await;
 }
 
@@ -810,6 +855,46 @@ async fn aggregate_byte_budgets_bound_large_records_across_connections() {
     assert!(matches!(second_reply, RpcOutcome::Accepted { status: 0, .. }));
     assert!(started.elapsed() >= Duration::from_millis(130));
     assert_eq!(vfs.max_concurrency_observed(), 1);
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn small_requests_reserve_only_the_buffer_bytes_they_can_use() {
+    // Byte budgets that fit exactly one maximum-size record. Reserving the
+    // full record size for every call would serialize these GETATTRs; sizing
+    // reservations to the actual request and its bounded reply lets them run
+    // concurrently.
+    const CLIENTS: usize = 8;
+    let mut limits = ServerLimits::production_defaults();
+    limits.max_buffered_request_bytes = limits.max_rpc_record_size;
+    limits.max_buffered_reply_bytes = limits.max_rpc_record_size;
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let mut clients = Vec::new();
+    for _ in 0..CLIENTS {
+        clients.push(RpcClient::connect(server.address).await);
+    }
+    let root = mount_root(&mut clients[0], b"/").await;
+    vfs.delay("getattr", Duration::from_millis(100));
+    vfs.reset_concurrency_observation();
+    let started = Instant::now();
+    let replies: Vec<_> = clients
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut client)| {
+            let arguments = nfs_args_handle(&root);
+            tokio::spawn(async move {
+                client
+                    .call_with_xid(800 + index as u32, NFS_PROGRAM, NFS_VERSION, 1, &arguments)
+                    .await
+            })
+        })
+        .collect();
+    for reply in replies {
+        assert!(matches!(reply.await.unwrap(), RpcOutcome::Accepted { status: 0, .. }));
+    }
+    assert_eq!(vfs.max_concurrency_observed(), CLIENTS);
+    assert!(started.elapsed() < Duration::from_millis(100 * CLIENTS as u64 / 2));
     server.shutdown().await;
 }
 
@@ -943,19 +1028,21 @@ async fn handles_are_scoped_to_server_export_and_integrity_tag() {
     let second_root = mount_root(&mut client, b"/second").await;
     assert_ne!(first_root, second_root);
 
-    let baseline_first = first_vfs.call_count("getattr");
-    let baseline_second = second_vfs.call_count("getattr");
+    // Replay entries are scoped by export: the same XID addresses two
+    // independent mutations, and only the exact retransmission is replayed.
+    let baseline_first = first_vfs.call_count("setattr");
+    let baseline_second = second_vfs.call_count("setattr");
     let _ = client
-        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&first_root))
+        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&first_root))
         .await;
     let _ = client
-        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&second_root))
+        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&second_root))
         .await;
     let _ = client
-        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 1, &nfs_args_handle(&first_root))
+        .call_with_xid(600, NFS_PROGRAM, NFS_VERSION, 2, &nfs_args_setattr(&second_root))
         .await;
-    assert_eq!(first_vfs.call_count("getattr"), baseline_first + 1);
-    assert_eq!(second_vfs.call_count("getattr"), baseline_second + 1);
+    assert_eq!(first_vfs.call_count("setattr"), baseline_first + 1);
+    assert_eq!(second_vfs.call_count("setattr"), baseline_second + 1);
 
     let mut cross_export = Encoder::new();
     cross_export.write_opaque(&first_root).unwrap();

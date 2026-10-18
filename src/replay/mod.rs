@@ -1,3 +1,3 @@
 mod cache;
 
-pub use cache::{ReplayCache, ReplayDecision, ReplayError, ReplayKey, RequestFingerprint};
+pub use cache::{ReplayCache, ReplayDecision, ReplayError, ReplayKey, ReplayLease, RequestFingerprint};

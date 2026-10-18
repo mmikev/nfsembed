@@ -14,5 +14,12 @@ mod tests {
         assert!(export_matches(b"/data", b"/data/subdir"));
         assert!(!export_matches(b"/data", b"/database"));
         assert!(export_matches(b"/", b"/anything"));
+        assert!(export_matches(b"/", b"/"));
+        assert!(export_matches(b"/data", b"/data/"));
+        assert!(!export_matches(b"/", b""));
+        assert!(!export_matches(b"/", b"relative"));
+        assert!(!export_matches(b"/data", b"/dat"));
+        assert!(!export_matches(b"/data", b"data"));
+        assert!(!export_matches(b"/data/sub", b"/data"));
     }
 }

@@ -118,7 +118,10 @@ impl ReplayCache {
         }
     }
 
-    pub async fn begin(
+    /// Classifies one request: the first caller executes it, exact duplicates
+    /// of an in-flight request wait for its reply, and exact duplicates of a
+    /// completed request replay the retained reply.
+    pub fn begin(
         self: &Arc<Self>,
         key: ReplayKey,
         fingerprint: RequestFingerprint,
@@ -256,15 +259,15 @@ impl ReplayCache {
         }
     }
 
-    pub async fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.inner().entries.len()
     }
 
-    pub async fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.inner().entries.is_empty()
     }
 
-    pub async fn retained_bytes(&self) -> usize {
+    pub fn retained_bytes(&self) -> usize {
         self.inner().completed_bytes
     }
 
@@ -365,28 +368,28 @@ mod tests {
     async fn duplicates_wait_then_replay() {
         let cache = Arc::new(ReplayCache::new(2, 1024, Duration::from_secs(10)));
         let fingerprint = RequestFingerprint([7; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
-        let waiter = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let waiter = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected waiter"),
         };
         lease.complete(Bytes::from_static(b"reply"));
         assert_eq!(waiter.await.unwrap().unwrap(), Bytes::from_static(b"reply"));
-        assert!(matches!(cache.begin(key(1), fingerprint).await.unwrap(), ReplayDecision::Replay(_)));
+        assert!(matches!(cache.begin(key(1), fingerprint).unwrap(), ReplayDecision::Replay(_)));
     }
 
     #[tokio::test]
     async fn segmented_replies_are_compacted_before_replay_retention() {
         let cache = Arc::new(ReplayCache::new(2, 2048, Duration::from_secs(10)));
         let fingerprint = RequestFingerprint([8; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
-        let waiter = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let waiter = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected waiter"),
         };
@@ -398,22 +401,22 @@ mod tests {
 
         let waited = waiter.await.unwrap().unwrap();
         assert_eq!(waited.segments()[1].as_ptr(), payload_pointer);
-        let replayed = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let replayed = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Replay(reply) => reply,
             _ => panic!("expected completed replay"),
         };
         assert_ne!(replayed.segments()[1].as_ptr(), payload_pointer);
-        assert_eq!(cache.retained_bytes().await, 1032);
+        assert_eq!(cache.retained_bytes(), 1032);
     }
 
     #[tokio::test]
     async fn different_fingerprint_is_xid_reuse() {
         let cache = Arc::new(ReplayCache::new(2, 1024, Duration::from_secs(10)));
-        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).await.unwrap() {
+        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected first execution"),
         };
-        let second = match cache.begin(key(1), RequestFingerprint([2; 32])).await.unwrap() {
+        let second = match cache.begin(key(1), RequestFingerprint([2; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected XID reuse execution"),
         };
@@ -424,31 +427,28 @@ mod tests {
     async fn cancelled_leader_releases_waiters_and_capacity() {
         let cache = Arc::new(ReplayCache::new(2, 1024, Duration::from_secs(10)));
         let fingerprint = RequestFingerprint([3; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
-        let waiter = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let waiter = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected waiter"),
         };
         drop(lease);
         assert_eq!(waiter.await.unwrap(), Err(ReplayError::Cancelled));
-        assert!(cache.is_empty().await);
+        assert!(cache.is_empty());
     }
 
     #[tokio::test]
     async fn capacity_one_allows_completed_xid_reuse() {
         let cache = Arc::new(ReplayCache::new(1, 1024, Duration::from_secs(10)));
-        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).await.unwrap() {
+        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected first execution"),
         };
         first.complete(Bytes::from_static(b"first"));
-        assert!(matches!(
-            cache.begin(key(1), RequestFingerprint([2; 32])).await.unwrap(),
-            ReplayDecision::Execute(_)
-        ));
+        assert!(matches!(cache.begin(key(1), RequestFingerprint([2; 32])).unwrap(), ReplayDecision::Execute(_)));
     }
 
     #[tokio::test]
@@ -456,23 +456,23 @@ mod tests {
         let cache = Arc::new(ReplayCache::new(4, 1024, Duration::from_secs(10)));
         let fingerprint_a = RequestFingerprint([1; 32]);
         let fingerprint_b = RequestFingerprint([2; 32]);
-        let first = match cache.begin(key(1), fingerprint_a).await.unwrap() {
+        let first = match cache.begin(key(1), fingerprint_a).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected first execution"),
         };
-        let first_waiter = match cache.begin(key(1), fingerprint_a).await.unwrap() {
+        let first_waiter = match cache.begin(key(1), fingerprint_a).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected a waiter for the first A generation"),
         };
-        let second = match cache.begin(key(1), fingerprint_b).await.unwrap() {
+        let second = match cache.begin(key(1), fingerprint_b).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected B execution"),
         };
-        let third = match cache.begin(key(1), fingerprint_a).await.unwrap() {
+        let third = match cache.begin(key(1), fingerprint_a).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected a new A execution instead of waiting for the old generation"),
         };
-        let third_waiter = match cache.begin(key(1), fingerprint_a).await.unwrap() {
+        let third_waiter = match cache.begin(key(1), fingerprint_a).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected a waiter for the latest A generation"),
         };
@@ -482,42 +482,36 @@ mod tests {
         second.complete(Bytes::from_static(b"b"));
         third.complete(Bytes::from_static(b"third-a"));
         assert_eq!(third_waiter.await.unwrap().unwrap(), Bytes::from_static(b"third-a"));
-        assert!(matches!(cache.begin(key(1), fingerprint_a).await.unwrap(), ReplayDecision::Replay(_)));
+        assert!(matches!(cache.begin(key(1), fingerprint_a).unwrap(), ReplayDecision::Replay(_)));
     }
 
     #[tokio::test]
     async fn completed_reply_bytes_evict_old_entries_and_skip_oversized_replies() {
         let cache = Arc::new(ReplayCache::new(4, 5, Duration::from_secs(10)));
-        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).await.unwrap() {
+        let first = match cache.begin(key(1), RequestFingerprint([1; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected first execution"),
         };
         first.complete(Bytes::from_static(b"1234"));
-        let second = match cache.begin(key(2), RequestFingerprint([2; 32])).await.unwrap() {
+        let second = match cache.begin(key(2), RequestFingerprint([2; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected second execution"),
         };
         second.complete(Bytes::from_static(b"5678"));
-        assert_eq!(cache.retained_bytes().await, 4);
-        assert_eq!(cache.len().await, 1);
-        assert!(matches!(
-            cache.begin(key(1), RequestFingerprint([1; 32])).await.unwrap(),
-            ReplayDecision::Execute(_)
-        ));
+        assert_eq!(cache.retained_bytes(), 4);
+        assert_eq!(cache.len(), 1);
+        assert!(matches!(cache.begin(key(1), RequestFingerprint([1; 32])).unwrap(), ReplayDecision::Execute(_)));
 
-        let oversized = match cache.begin(key(3), RequestFingerprint([3; 32])).await.unwrap() {
+        let oversized = match cache.begin(key(3), RequestFingerprint([3; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected oversized execution"),
         };
         oversized.complete(Bytes::from_static(b"123456"));
-        assert!(cache.retained_bytes().await <= 5);
-        assert!(!matches!(
-            cache.begin(key(3), RequestFingerprint([3; 32])).await.unwrap(),
-            ReplayDecision::Replay(_)
-        ));
+        assert!(cache.retained_bytes() <= 5);
+        assert!(!matches!(cache.begin(key(3), RequestFingerprint([3; 32])).unwrap(), ReplayDecision::Replay(_)));
 
         for xid in 10..100 {
-            let lease = match cache.begin(key(xid), RequestFingerprint([xid as u8; 32])).await.unwrap() {
+            let lease = match cache.begin(key(xid), RequestFingerprint([xid as u8; 32])).unwrap() {
                 ReplayDecision::Execute(lease) => lease,
                 _ => panic!("expected oversized execution"),
             };
@@ -532,14 +526,14 @@ mod tests {
     async fn owned_backing_capacity_counts_toward_the_replay_byte_limit() {
         let cache = Arc::new(ReplayCache::new(3, 64, Duration::from_secs(10)));
         let existing_fingerprint = RequestFingerprint([8; 32]);
-        let existing = match cache.begin(key(2), existing_fingerprint).await.unwrap() {
+        let existing = match cache.begin(key(2), existing_fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected existing execution"),
         };
         existing.complete(Vec::from(&b"keep"[..]));
 
         let fingerprint = RequestFingerprint([9; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
@@ -547,28 +541,28 @@ mod tests {
         allocation.extend_from_slice(b"tiny");
         lease.complete(EncodedReply::from(allocation));
 
-        assert_eq!(cache.retained_bytes().await, 4);
-        assert!(matches!(cache.begin(key(2), existing_fingerprint).await.unwrap(), ReplayDecision::Replay(_)));
-        assert!(matches!(cache.begin(key(1), fingerprint).await.unwrap(), ReplayDecision::Execute(_)));
+        assert_eq!(cache.retained_bytes(), 4);
+        assert!(matches!(cache.begin(key(2), existing_fingerprint).unwrap(), ReplayDecision::Replay(_)));
+        assert!(matches!(cache.begin(key(1), fingerprint).unwrap(), ReplayDecision::Execute(_)));
     }
 
     #[tokio::test]
     async fn stale_segmented_generation_is_not_retained() {
         let cache = Arc::new(ReplayCache::new(3, 2048, Duration::from_secs(10)));
         let stale_fingerprint = RequestFingerprint([10; 32]);
-        let stale = match cache.begin(key(1), stale_fingerprint).await.unwrap() {
+        let stale = match cache.begin(key(1), stale_fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected stale execution"),
         };
         let latest_fingerprint = RequestFingerprint([11; 32]);
-        let latest = match cache.begin(key(1), latest_fingerprint).await.unwrap() {
+        let latest = match cache.begin(key(1), latest_fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected latest execution"),
         };
 
         stale.complete(EncodedReply::segmented(Bytes::from_static(b"prefix"), Bytes::from(vec![0x5a; 1024]), 0));
-        assert_eq!(cache.retained_bytes().await, 0);
-        assert!(matches!(cache.begin(key(1), latest_fingerprint).await.unwrap(), ReplayDecision::Wait(_)));
+        assert_eq!(cache.retained_bytes(), 0);
+        assert!(matches!(cache.begin(key(1), latest_fingerprint).unwrap(), ReplayDecision::Wait(_)));
         drop(latest);
     }
 
@@ -577,7 +571,7 @@ mod tests {
         let cache = Arc::new(ReplayCache::new(4, 1024, Duration::from_secs(10)));
         for generation in 0..1000u32 {
             let fingerprint = RequestFingerprint([generation as u8; 32]);
-            let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+            let lease = match cache.begin(key(1), fingerprint).unwrap() {
                 ReplayDecision::Execute(lease) => lease,
                 _ => panic!("expected a new generation"),
             };
@@ -592,15 +586,15 @@ mod tests {
     async fn concurrent_xid_reuse_does_not_cancel_exact_waiters() {
         let cache = Arc::new(ReplayCache::new(4, 1024, Duration::from_secs(10)));
         let first_fingerprint = RequestFingerprint([1; 32]);
-        let first = match cache.begin(key(1), first_fingerprint).await.unwrap() {
+        let first = match cache.begin(key(1), first_fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected first execution"),
         };
-        let waiter = match cache.begin(key(1), first_fingerprint).await.unwrap() {
+        let waiter = match cache.begin(key(1), first_fingerprint).unwrap() {
             ReplayDecision::Wait(waiter) => waiter,
             _ => panic!("expected exact waiter"),
         };
-        let reused = match cache.begin(key(1), RequestFingerprint([2; 32])).await.unwrap() {
+        let reused = match cache.begin(key(1), RequestFingerprint([2; 32])).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected independent XID reuse"),
         };
@@ -613,11 +607,11 @@ mod tests {
     async fn ttl_never_expires_a_live_leader() {
         let cache = Arc::new(ReplayCache::new(2, 1024, Duration::ZERO));
         let fingerprint = RequestFingerprint([4; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
-        assert!(matches!(cache.begin(key(1), fingerprint).await.unwrap(), ReplayDecision::Wait(_)));
+        assert!(matches!(cache.begin(key(1), fingerprint).unwrap(), ReplayDecision::Wait(_)));
         drop(lease);
     }
 
@@ -625,22 +619,19 @@ mod tests {
     async fn disconnected_duplicate_waiters_do_not_exhaust_entry_capacity() {
         let cache = Arc::new(ReplayCache::new(2, 1024, Duration::from_secs(10)));
         let fingerprint = RequestFingerprint([5; 32]);
-        let lease = match cache.begin(key(1), fingerprint).await.unwrap() {
+        let lease = match cache.begin(key(1), fingerprint).unwrap() {
             ReplayDecision::Execute(lease) => lease,
             _ => panic!("expected execution lease"),
         };
         for _ in 0..8 {
-            let waiter = match cache.begin(key(1), fingerprint).await.unwrap() {
+            let waiter = match cache.begin(key(1), fingerprint).unwrap() {
                 ReplayDecision::Wait(waiter) => waiter,
                 _ => panic!("expected duplicate waiter"),
             };
             drop(waiter);
         }
 
-        assert!(matches!(
-            cache.begin(key(2), RequestFingerprint([6; 32])).await.unwrap(),
-            ReplayDecision::Execute(_)
-        ));
+        assert!(matches!(cache.begin(key(2), RequestFingerprint([6; 32])).unwrap(), ReplayDecision::Execute(_)));
         drop(lease);
     }
 }

@@ -23,11 +23,9 @@ use nfsembed::vfs::{
     NfsName, NfsTime, ObjectKey, PathConf, ReadDirectoryPage, ReadResult, RequestContext, SetAttributes, SetTime,
     VfsCapabilities, VirtualFileSystem, WccAttributes, WriteResult, WriteStability,
 };
-#[cfg(feature = "demo")]
 use nfsembed::{AuthPolicy, NfsServer, PortmapperSockets};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-#[cfg(feature = "demo")]
 use tokio::net::{TcpListener, UdpSocket};
 use tracing::debug;
 
@@ -1431,11 +1429,11 @@ fn set_time_to_file_time(time: SetTime) -> filetime::FileTime {
     }
 }
 
-#[cfg(feature = "demo")]
+// `certification_server` also includes this file as a backend module, where
+// the example entry point is unused.
 #[allow(dead_code)]
 const HOST_PORT: u16 = 11111;
 
-#[cfg(feature = "demo")]
 #[allow(dead_code)]
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

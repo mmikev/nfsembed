@@ -7,7 +7,8 @@ mod portmapper;
 
 use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard, PoisonError};
+use std::task::Poll;
 
 pub use builder::NfsServerBuilder;
 pub use config::{AuthPolicy, PortmapperMode};
@@ -26,41 +27,61 @@ use crate::rpc::codec::{DecodeError, EncodeError};
 use crate::rpc::record::RecordError;
 use crate::vfs::VirtualFileSystem;
 
+/// Tracks request executions, which outlive their connection so that a
+/// mutation whose reply was lost still completes and populates the replay
+/// cache. Shutdown waits for, or aborts, every tracked execution.
 pub(crate) struct ExecutionTracker {
-    tasks: Mutex<JoinSet<()>>,
+    // A synchronous lock: it is only held to spawn, reap, or poll tasks and
+    // never across an await point.
+    tasks: std::sync::Mutex<JoinSet<()>>,
 }
 
 impl ExecutionTracker {
     fn new() -> Self {
         Self {
-            tasks: Mutex::new(JoinSet::new()),
+            tasks: std::sync::Mutex::new(JoinSet::new()),
         }
     }
 
-    async fn spawn<F>(&self, future: F)
+    fn spawn<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.tasks();
         while let Some(result) = tasks.try_join_next() {
-            if let Err(error) = result {
-                tracing::warn!(error = %error, "request execution task failed");
-            }
+            log_execution_failure(result);
         }
         tasks.spawn(future);
     }
 
+    /// Waits until every tracked execution, including any spawned while
+    /// waiting, has finished.
     async fn wait(&self) {
-        let mut tasks = self.tasks.lock().await;
-        while let Some(result) = tasks.join_next().await {
-            if let Err(error) = result {
-                tracing::warn!(error = %error, "request execution task failed");
+        std::future::poll_fn(|context| {
+            let mut tasks = self.tasks();
+            loop {
+                match tasks.poll_join_next(context) {
+                    Poll::Ready(Some(result)) => log_execution_failure(result),
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Pending => return Poll::Pending,
+                }
             }
-        }
+        })
+        .await
     }
 
-    async fn abort_all(&self) {
-        self.tasks.lock().await.abort_all();
+    fn abort_all(&self) {
+        self.tasks().abort_all();
+    }
+
+    fn tasks(&self) -> MutexGuard<'_, JoinSet<()>> {
+        self.tasks.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+fn log_execution_failure(result: Result<(), JoinError>) {
+    if let Err(error) = result {
+        tracing::warn!(error = %error, "request execution task failed");
     }
 }
 
@@ -80,7 +101,7 @@ pub enum ServerError {
     #[error(transparent)]
     Record(#[from] RecordError),
     #[error(transparent)]
-    Decode(DecodeError),
+    Decode(#[from] DecodeError),
     #[error(transparent)]
     Encode(#[from] EncodeError),
     #[error(transparent)]
@@ -115,13 +136,13 @@ impl NfsServer {
         NfsServerBuilder::new(vfs)
     }
 
-    pub(crate) fn from_builder(builder: NfsServerBuilder) -> Result<Self, ServerError> {
-        Ok(Self {
+    fn from_builder(builder: NfsServerBuilder) -> Self {
+        Self {
             exports: Arc::new(builder.exports),
             limits: builder.limits,
             auth_policy: builder.auth_policy,
             portmapper: builder.portmapper,
-        })
+        }
     }
 
     pub async fn start(&self, listener: TcpListener) -> Result<ServerHandle, ServerError> {
@@ -317,7 +338,7 @@ async fn run(
         while tasks.join_next().await.is_some() {}
         services.abort_all();
         while services.join_next().await.is_some() {}
-        executions.abort_all().await;
+        executions.abort_all();
         executions.wait().await;
     }
     Ok(())
@@ -433,6 +454,45 @@ mod tests {
         assert!(decoder.read_opaque("verifier", 400).unwrap().is_empty());
         assert_eq!(decoder.read_u32().unwrap(), 0);
         decoder
+    }
+
+    #[tokio::test]
+    async fn execution_tracker_waits_for_late_spawns_and_aborts_pending_work() {
+        let tracker = Arc::new(ExecutionTracker::new());
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let (finished, mut finished_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let first_finished = finished.clone();
+        tracker.spawn(async move {
+            let _ = released.await;
+            let _ = first_finished.send("first");
+        });
+        let waiter = {
+            let tracker = tracker.clone();
+            tokio::spawn(async move { tracker.wait().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        // Work spawned while shutdown is draining is drained too.
+        tracker.spawn(async move {
+            let _ = finished.send("late");
+        });
+        release.send(()).unwrap();
+        waiter.await.unwrap();
+        let mut completed = vec![
+            finished_receiver.recv().await.unwrap(),
+            finished_receiver.recv().await.unwrap(),
+        ];
+        completed.sort_unstable();
+        assert_eq!(completed, ["first", "late"]);
+
+        let (_never, pending) = tokio::sync::oneshot::channel::<()>();
+        tracker.spawn(async move {
+            let _ = pending.await;
+        });
+        tracker.abort_all();
+        tokio::time::timeout(std::time::Duration::from_secs(1), tracker.wait())
+            .await
+            .expect("aborted executions must not keep wait() pending");
     }
 
     #[tokio::test]

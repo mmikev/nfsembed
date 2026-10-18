@@ -24,13 +24,10 @@ impl NfsServerBuilder {
         }
     }
 
+    /// Sets the primary export's MOUNT path. A leading `/` is added when it
+    /// is missing.
     pub fn export_name(mut self, name: impl Into<String>) -> Self {
-        let name = name.into();
-        self.exports[0].path = if name.starts_with('/') {
-            name
-        } else {
-            format!("/{name}")
-        };
+        self.exports[0].path = absolute_export_path(name.into());
         self
     }
 
@@ -57,15 +54,10 @@ impl NfsServerBuilder {
     }
 
     fn push_export(&mut self, export_id: ExportId, name: String, vfs: Arc<dyn VirtualFileSystem>) {
-        let path = if name.starts_with('/') {
-            name
-        } else {
-            format!("/{name}")
-        };
         self.exports.push(ExportState {
             vfs,
             id: export_id,
-            path,
+            path: absolute_export_path(name),
         });
     }
 
@@ -102,6 +94,14 @@ impl NfsServerBuilder {
                 return Err(ServerError::InvalidConfiguration("export IDs and paths must be unique"));
             }
         }
-        NfsServer::from_builder(self)
+        Ok(NfsServer::from_builder(self))
+    }
+}
+
+fn absolute_export_path(name: String) -> String {
+    if name.starts_with('/') {
+        name
+    } else {
+        format!("/{name}")
     }
 }

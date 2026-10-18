@@ -10,22 +10,10 @@ use tokio::time::timeout;
 use super::{ServerError, ServerLimits};
 use crate::portmap::mapping;
 use crate::rpc::auth::{decode_principal, AUTH_NONE};
-use crate::rpc::codec::{Decoder, Encoder};
+use crate::rpc::codec::Decoder;
+use crate::rpc::message::{self, AcceptStatus, AuthStatus, VersionRange};
 use crate::rpc::record::{read_record, write_record_limited, RecordLimits};
 
-const RPC_CALL: u32 = 0;
-const RPC_REPLY: u32 = 1;
-const MSG_ACCEPTED: u32 = 0;
-const MSG_DENIED: u32 = 1;
-const SUCCESS: u32 = 0;
-const PROG_UNAVAIL: u32 = 1;
-const PROG_MISMATCH: u32 = 2;
-const PROC_UNAVAIL: u32 = 3;
-const GARBAGE_ARGS: u32 = 4;
-const RPC_MISMATCH: u32 = 0;
-const AUTH_ERROR: u32 = 1;
-const AUTH_BAD_CRED: u32 = 1;
-const AUTH_BAD_VERF: u32 = 3;
 const PORTMAP_NULL: u32 = 0;
 const PORTMAP_GETPORT: u32 = 3;
 const MAX_PORTMAP_RECORD_SIZE: usize = 4096;
@@ -236,133 +224,67 @@ async fn serve_tcp_connection(
 }
 
 fn dispatch_record(record: &[u8], nfs_port: u16, mount_port: u16) -> Option<Vec<u8>> {
+    let garbage = |xid| Some(message::accepted_reply(xid, AcceptStatus::GarbageArguments, &[]));
     let mut decoder = Decoder::new(record);
     let xid = decoder.read_u32().ok()?;
-    let message_type = match decoder.read_u32() {
-        Ok(message_type) => message_type,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
+    let Ok(message_type) = decoder.read_u32() else {
+        return garbage(xid);
     };
-    if message_type != RPC_CALL {
+    if message_type != message::CALL {
         return None;
     }
-    let rpc_version = match decoder.read_u32() {
-        Ok(version) => version,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
+    let Ok(rpc_version) = decoder.read_u32() else {
+        return garbage(xid);
     };
-    if rpc_version != 2 {
-        return Some(rpc_mismatch(xid));
+    if rpc_version != message::RPC_VERSION {
+        return Some(message::rpc_mismatch(xid));
     }
-    let program = match decoder.read_u32() {
-        Ok(program) => program,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
+    let (Ok(program), Ok(version), Ok(procedure), Ok(credential_flavor)) =
+        (decoder.read_u32(), decoder.read_u32(), decoder.read_u32(), decoder.read_u32())
+    else {
+        return garbage(xid);
     };
-    let version = match decoder.read_u32() {
-        Ok(version) => version,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
-    };
-    let procedure = match decoder.read_u32() {
-        Ok(procedure) => procedure,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
-    };
-    let credential_flavor = match decoder.read_u32() {
-        Ok(flavor) => flavor,
-        Err(_) => return Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
-    };
-    let credential = match decoder.read_opaque_slice("RPC credential", 400) {
-        Ok(credential) => credential,
-        Err(_) => return Some(auth_error(xid, AUTH_BAD_CRED)),
-    };
-    if decode_principal(credential_flavor, credential).is_err() {
-        return Some(auth_error(xid, AUTH_BAD_CRED));
+    let credential_valid = decoder
+        .read_opaque_slice("RPC credential", 400)
+        .is_ok_and(|credential| decode_principal(credential_flavor, credential).is_ok());
+    if !credential_valid {
+        return Some(message::auth_error(xid, AuthStatus::BadCredential));
     }
-    let verifier_flavor = match decoder.read_u32() {
-        Ok(flavor) => flavor,
-        Err(_) => return Some(auth_error(xid, AUTH_BAD_VERF)),
-    };
-    let verifier = match decoder.read_opaque_slice("RPC verifier", 400) {
-        Ok(verifier) => verifier,
-        Err(_) => return Some(auth_error(xid, AUTH_BAD_VERF)),
-    };
-    if verifier_flavor != AUTH_NONE || !verifier.is_empty() {
-        return Some(auth_error(xid, AUTH_BAD_VERF));
+    let verifier_valid = decoder.read_u32().is_ok_and(|flavor| flavor == AUTH_NONE)
+        && decoder.read_opaque_slice("RPC verifier", 400).is_ok_and(<[u8]>::is_empty);
+    if !verifier_valid {
+        return Some(message::auth_error(xid, AuthStatus::BadVerifier));
     }
     if program != crate::portmap::PROGRAM {
-        return Some(accepted_reply(xid, PROG_UNAVAIL, &[]));
+        return Some(message::accepted_reply(xid, AcceptStatus::ProgramUnavailable, &[]));
     }
     if version != crate::portmap::VERSION {
-        let mut body = Encoder::new();
-        body.write_u32(crate::portmap::VERSION);
-        body.write_u32(crate::portmap::VERSION);
-        return Some(accepted_reply(xid, PROG_MISMATCH, &body.into_bytes()));
+        return Some(message::program_mismatch(xid, VersionRange::exact(crate::portmap::VERSION)));
     }
     let args = &record[decoder.position()..];
     match procedure {
-        PORTMAP_NULL if args.is_empty() => Some(accepted_reply(xid, SUCCESS, &[])),
-        PORTMAP_NULL => Some(accepted_reply(xid, GARBAGE_ARGS, &[])),
+        PORTMAP_NULL if args.is_empty() => Some(message::accepted_reply(xid, AcceptStatus::Success, &[])),
         PORTMAP_GETPORT => {
-            let request = (|| {
-                let mut decoder = Decoder::new(args);
-                let request = mapping {
-                    prog: decoder.read_u32()?,
-                    vers: decoder.read_u32()?,
-                    prot: decoder.read_u32()?,
-                    port: decoder.read_u32()?,
-                };
-                decoder.finish()?;
-                Ok::<_, crate::rpc::codec::DecodeError>(request)
-            })();
-            let Ok(request) = request else {
-                return Some(accepted_reply(xid, GARBAGE_ARGS, &[]));
+            let Ok(request) = mapping::decode(args) else {
+                return garbage(xid);
             };
-            let mut body = Encoder::new();
-            body.write_u32(crate::portmap::dispatch::get_port(&request, nfs_port, mount_port));
-            Some(accepted_reply(xid, SUCCESS, &body.into_bytes()))
+            let port = crate::portmap::dispatch::get_port(&request, nfs_port, mount_port);
+            Some(message::accepted_reply(xid, AcceptStatus::Success, &port.to_be_bytes()))
         },
-        _ => Some(accepted_reply(xid, PROC_UNAVAIL, &[])),
+        PORTMAP_NULL => garbage(xid),
+        _ => Some(message::accepted_reply(xid, AcceptStatus::ProcedureUnavailable, &[])),
     }
-}
-
-fn accepted_reply(xid: u32, status: u32, body: &[u8]) -> Vec<u8> {
-    let mut reply = Encoder::new();
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(MSG_ACCEPTED);
-    reply.write_u32(AUTH_NONE);
-    reply.write_u32(0);
-    reply.write_u32(status);
-    reply.write_fixed(body);
-    reply.into_bytes()
-}
-
-fn rpc_mismatch(xid: u32) -> Vec<u8> {
-    let mut reply = Encoder::new();
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(MSG_DENIED);
-    reply.write_u32(RPC_MISMATCH);
-    reply.write_u32(2);
-    reply.write_u32(2);
-    reply.into_bytes()
-}
-
-fn auth_error(xid: u32, status: u32) -> Vec<u8> {
-    let mut reply = Encoder::new();
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(MSG_DENIED);
-    reply.write_u32(AUTH_ERROR);
-    reply.write_u32(status);
-    reply.into_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::codec::Encoder;
 
     fn call(xid: u32, rpc_version: u32, program: u32, version: u32, procedure: u32, args: &[u8]) -> Vec<u8> {
         let mut request = Encoder::new();
         request.write_u32(xid);
-        request.write_u32(RPC_CALL);
+        request.write_u32(message::CALL);
         request.write_u32(rpc_version);
         request.write_u32(program);
         request.write_u32(version);
@@ -378,9 +300,9 @@ mod tests {
     fn outcome(reply: &[u8]) -> (u32, u32, Vec<u8>) {
         let mut decoder = Decoder::new(reply);
         let xid = decoder.read_u32().unwrap();
-        assert_eq!(decoder.read_u32().unwrap(), RPC_REPLY);
+        assert_eq!(decoder.read_u32().unwrap(), message::REPLY);
         let reply_status = decoder.read_u32().unwrap();
-        if reply_status == MSG_ACCEPTED {
+        if reply_status == message::MSG_ACCEPTED {
             assert_eq!(decoder.read_u32().unwrap(), AUTH_NONE);
             assert!(decoder.read_opaque("verifier", 400).unwrap().is_empty());
         }
@@ -402,7 +324,7 @@ mod tests {
         )
         .unwrap();
         let (xid, status, body) = outcome(&reply);
-        assert_eq!((xid, status), (7, SUCCESS));
+        assert_eq!((xid, status), (7, AcceptStatus::Success as u32));
         assert_eq!(u32::from_be_bytes(body.try_into().unwrap()), 40_049);
 
         let mismatch =
@@ -410,17 +332,17 @@ mod tests {
                 .unwrap();
         let mut decoder = Decoder::new(&mismatch);
         assert_eq!(decoder.read_u32().unwrap(), 8);
-        assert_eq!(decoder.read_u32().unwrap(), RPC_REPLY);
-        assert_eq!(decoder.read_u32().unwrap(), MSG_DENIED);
-        assert_eq!(decoder.read_u32().unwrap(), RPC_MISMATCH);
+        assert_eq!(decoder.read_u32().unwrap(), message::REPLY);
+        assert_eq!(decoder.read_u32().unwrap(), message::MSG_DENIED);
+        assert_eq!(decoder.read_u32().unwrap(), message::RPC_MISMATCH);
         assert_eq!((decoder.read_u32().unwrap(), decoder.read_u32().unwrap()), (2, 2));
         decoder.finish().unwrap();
 
         let unavailable = dispatch_record(&call(9, 2, 999_999, 1, 0, &[]), 1, 1).unwrap();
-        assert_eq!(outcome(&unavailable).1, PROG_UNAVAIL);
+        assert_eq!(outcome(&unavailable).1, AcceptStatus::ProgramUnavailable as u32);
         let bad_args =
             dispatch_record(&call(10, 2, crate::portmap::PROGRAM, crate::portmap::VERSION, PORTMAP_GETPORT, &[]), 1, 1)
                 .unwrap();
-        assert_eq!(outcome(&bad_args).1, GARBAGE_ARGS);
+        assert_eq!(outcome(&bad_args).1, AcceptStatus::GarbageArguments as u32);
     }
 }

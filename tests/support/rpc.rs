@@ -289,6 +289,16 @@ pub fn nfs_args_directory(handle: &[u8], name: &[u8]) -> Vec<u8> {
     encoder.into_bytes()
 }
 
+/// SETATTR arguments that change nothing and carry no guard: the cheapest
+/// non-idempotent call, used to exercise the replay cache.
+pub fn nfs_args_setattr(handle: &[u8]) -> Vec<u8> {
+    let mut encoder = Encoder::new();
+    encoder.write_opaque(handle).unwrap();
+    encode_empty_set_attributes(&mut encoder);
+    encoder.write_bool(false);
+    encoder.into_bytes()
+}
+
 pub fn encode_empty_set_attributes(encoder: &mut Encoder) {
     encoder.write_bool(false);
     encoder.write_bool(false);

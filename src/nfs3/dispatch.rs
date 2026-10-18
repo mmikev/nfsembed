@@ -53,4 +53,76 @@ impl Procedure {
             _ => return None,
         })
     }
+
+    /// The RFC 1813 procedure name, used in tracing.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Null => "NULL",
+            Self::GetAttr => "GETATTR",
+            Self::SetAttr => "SETATTR",
+            Self::Lookup => "LOOKUP",
+            Self::Access => "ACCESS",
+            Self::ReadLink => "READLINK",
+            Self::Read => "READ",
+            Self::Write => "WRITE",
+            Self::Create => "CREATE",
+            Self::Mkdir => "MKDIR",
+            Self::Symlink => "SYMLINK",
+            Self::Mknod => "MKNOD",
+            Self::Remove => "REMOVE",
+            Self::Rmdir => "RMDIR",
+            Self::Rename => "RENAME",
+            Self::Link => "LINK",
+            Self::ReadDir => "READDIR",
+            Self::ReadDirPlus => "READDIRPLUS",
+            Self::FsStat => "FSSTAT",
+            Self::FsInfo => "FSINFO",
+            Self::PathConf => "PATHCONF",
+            Self::Commit => "COMMIT",
+        }
+    }
+
+    /// Whether re-executing a retransmitted call could observe or cause a
+    /// different outcome than the original execution. Only these procedures
+    /// need the duplicate-request cache's at-most-once guarantee; every other
+    /// procedure is simply executed again when it is retransmitted.
+    pub fn is_non_idempotent(self) -> bool {
+        matches!(
+            self,
+            Self::SetAttr
+                | Self::Write
+                | Self::Create
+                | Self::Mkdir
+                | Self::Symlink
+                | Self::Mknod
+                | Self::Remove
+                | Self::Rmdir
+                | Self::Rename
+                | Self::Link
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wire_numbers_names_and_idempotency_are_consistent() {
+        for value in 0..crate::nfs3::types::PROCEDURE_COUNT {
+            let procedure = Procedure::from_wire(value).unwrap();
+            assert_eq!(procedure as u32, value);
+            assert!(!procedure.name().is_empty());
+        }
+        assert_eq!(Procedure::from_wire(crate::nfs3::types::PROCEDURE_COUNT), None);
+        let non_idempotent: Vec<_> = (0..crate::nfs3::types::PROCEDURE_COUNT)
+            .filter_map(Procedure::from_wire)
+            .filter(|procedure| procedure.is_non_idempotent())
+            .map(Procedure::name)
+            .collect();
+        assert_eq!(
+            non_idempotent,
+            ["SETATTR", "WRITE", "CREATE", "MKDIR", "SYMLINK", "MKNOD", "REMOVE", "RMDIR", "RENAME", "LINK"]
+        );
+    }
 }

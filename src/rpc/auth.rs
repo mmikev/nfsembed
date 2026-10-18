@@ -43,6 +43,55 @@ mod tests {
     use crate::rpc::codec::Encoder;
 
     #[test]
+    fn auth_sys_credentials_decode_every_identity_field() {
+        let mut body = Encoder::new();
+        body.write_u32(0x1234);
+        body.write_opaque(b"host").unwrap();
+        body.write_u32(1000);
+        body.write_u32(100);
+        body.write_u32(2);
+        body.write_u32(10);
+        body.write_u32(20);
+        assert_eq!(
+            decode_principal(AUTH_SYS, &body.into_bytes()),
+            Ok(Principal::AuthSys {
+                uid: 1000,
+                gid: 100,
+                supplementary_gids: vec![10, 20],
+                machine_name: b"host".to_vec(),
+            })
+        );
+    }
+
+    #[test]
+    fn malformed_and_unsupported_credentials_are_rejected() {
+        assert_eq!(decode_principal(AUTH_NONE, &[]), Ok(Principal::Anonymous));
+        assert_eq!(decode_principal(AUTH_NONE, &[0; 4]), Err(DecodeError::TrailingBytes));
+        assert_eq!(
+            decode_principal(6, &[]),
+            Err(DecodeError::InvalidDiscriminant {
+                kind: "authentication flavor",
+                value: 6,
+            })
+        );
+        let mut trailing = Encoder::new();
+        trailing.write_u32(0);
+        trailing.write_opaque(b"").unwrap();
+        trailing.write_u32(0);
+        trailing.write_u32(0);
+        trailing.write_u32(0);
+        trailing.write_u32(0);
+        assert_eq!(decode_principal(AUTH_SYS, &trailing.into_bytes()), Err(DecodeError::TrailingBytes));
+        let mut long_name = Encoder::new();
+        long_name.write_u32(0);
+        long_name.write_opaque(&[b'x'; MAX_MACHINE_NAME + 1]).unwrap();
+        assert!(matches!(
+            decode_principal(AUTH_SYS, &long_name.into_bytes()),
+            Err(DecodeError::LimitExceeded { .. })
+        ));
+    }
+
+    #[test]
     fn auth_sys_group_limit_is_enforced() {
         let mut body = Encoder::new();
         body.write_u32(0);

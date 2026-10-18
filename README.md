@@ -42,8 +42,8 @@ The high-level API changes are:
 | Create an `NFSTcpListener` that owns its listener and runs forever | Give an application-owned `TcpListener` to `NfsServer::start` or `NfsServer::serve` | The embedding application owns the Tokio runtime, socket binding, shutdown signal, and process lifecycle; `serve` also lets it place the top-level future. |
 | Identify backend objects with a bare integer | Return an `ObjectKey { file_id, generation }` | Reused backend IDs can be distinguished and protected inside authenticated NFS handles. |
 | Return operation-specific values and let handlers fetch attributes separately | Return `MutationResult<T>` with atomic before/after WCC data | NFS weak-cache-consistency replies no longer race separate `getattr` calls. |
-| Treat duplicate XIDs as requests to drop | Wait for or replay the original encoded reply | Client retransmissions get at-most-once behavior while the bounded replay entry is retained. |
-| Keep the host-filesystem demo in the main API | Keep it behind the non-default `demo` feature | The production contract is platform-neutral and does not define policy through a sample host backend. |
+| Treat duplicate XIDs as requests to drop | Wait for or replay the original encoded reply of a non-idempotent call | Retransmitted mutations get at-most-once behavior while the bounded replay entry is retained. |
+| Keep the host-filesystem demo in the main API | Ship host-filesystem backends only as examples | The production contract is platform-neutral and does not define policy through a sample host backend. |
 
 Embedded lifecycle
 ------------------
@@ -112,7 +112,9 @@ The new RPC/XDR layer:
 
 * bounds records, fragments, fragment counts, opaque fields, strings, arrays,
   AUTH_SYS groups, file handles, names, symlink targets, and transfer sizes;
-* reserves aggregate memory before allocating record or reply bodies;
+* reserves aggregate memory before allocating record or reply bodies, sized to
+  each call (a single-fragment record reserves its own length; a reply
+  reserves the bound of its procedure and requested transfer count);
 * uses checked arithmetic and rejects trailing or truncated arguments;
 * rejects non-canonical booleans and invalid enum/union discriminants;
 * returns decoding errors instead of allocating from unchecked wire lengths or
@@ -143,15 +145,32 @@ are reaped, and buffer permits remain owned by detached tracked executions until
 their request/reply memory is gone. No server lock is held while awaiting
 application VFS code.
 
+Buffer budgets are charged by size rather than per call. A single-fragment
+request reserves exactly its record length, and a fragmented one reserves the
+maximum record size before its first body byte is read. A reply reserves an
+upper bound derived from the call: READ and READDIR/READDIRPLUS replies scale
+with the client's (server-clamped) count; READLINK, DUMP, and EXPORT replies
+reserve the record limit; every other reply fits a small fixed bound. A reply
+that would exceed its reservation is replaced by `SYSTEM_ERR`. Small metadata
+calls therefore never queue behind the byte budget of a maximum-size record.
+
 Replay and file-handle safety
 -----------------------------
 
-The old seen-XID tracker was replaced by a per-run reply cache. Its request
-fingerprint includes program, version, procedure, principal identity, and a
-digest of the arguments. Exact in-flight duplicates wait; exact completed
-duplicates receive the cached bytes; a changed fingerprint is treated as XID
-reuse. Concurrent XID generations, cancellation, lost socket replies, capacity,
-TTL, and retained reply bytes are all handled explicitly.
+The old seen-XID tracker was replaced by a per-run reply cache for the
+non-idempotent NFSv3 procedures (SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD,
+REMOVE, RMDIR, RENAME, and LINK). Its request fingerprint includes program,
+version, procedure, principal identity, and a digest of the arguments. Exact
+in-flight duplicates wait; exact completed duplicates receive the cached bytes;
+a changed fingerprint is treated as XID reuse. Concurrent XID generations,
+cancellation, lost socket replies, capacity, TTL, and retained reply bytes are
+all handled explicitly.
+
+Idempotent calls (reads, lookups, attribute and filesystem queries, COMMIT,
+MOUNT, and portmapper) are executed again when retransmitted, as in other NFS
+servers' duplicate-request caches. They are never fingerprinted or retained,
+so bulk READ and READDIR payloads neither cost a copy nor evict the mutation
+replies that need at-most-once protection.
 
 NFS file handles now contain a format version, server-instance identity, export
 identity, backend file ID, backend generation, and keyed integrity tag while
@@ -205,8 +224,10 @@ Applications moving from the upstream version should:
    library to mount, elevate privileges, or manage signals.
 6. Make backend futures cancellation-safe because the server drops them when
    the request deadline expires.
-7. Keep using the old demo API only temporarily with `--features demo`; there
-   is no automatic adapter from `NFSFileSystem` to the production VFS contract.
+7. Port any remaining `NFSFileSystem` code to `VirtualFileSystem`; the old
+   demo API and its `demo` feature have been removed, and there is no automatic
+   adapter. `examples/mirrorfs.rs` is a complete host-filesystem backend on the
+   production contract.
 
 Usage
 =====
@@ -317,8 +338,10 @@ Performance benchmarks
 
 Criterion benchmarks cover large RPC opaque values, zero-copy WRITE decoding,
 segmented READ reply assembly and replay cloning, fragmented record I/O,
-READDIR response truncation, full replay-cache hits, and authenticated
-file-handle encoding and verification. Run them with:
+streaming READDIR encoding with truncation, full replay-cache hits,
+authenticated file-handle encoding and verification, and end-to-end loopback
+GETATTR, READ, and READDIRPLUS round trips, including many concurrent clients
+against a backend with latency. Run them with:
 
 ```sh
 cargo bench --bench performance
@@ -351,8 +374,8 @@ Basic Source Layout
  - `src/replay/`: count-, byte-, TTL-, and XID-generation-bounded duplicate-request reply cache.
  - `src/handles/`: authenticated, instance-scoped file-handle encoding.
 
-The pre-1.0 implementation remains available only to the `demo` feature for
-temporary migration compatibility.
+The host-filesystem examples run without extra features:
+`cargo run --example demo` and `cargo run --example mirrorfs -- <directory>`.
 
 
 Protocol flow
@@ -429,4 +452,5 @@ NFSv3 operations are request-oriented and do not establish a server-side open
 file session. The overall implementation is not completely stateless, however:
 the application VFS owns filesystem state, and each server run keeps bounded
 mount and replay tables. The replay cache is required to give retransmitted
-mutations at-most-once behavior while their entries remain retained.
+mutations at-most-once behavior while their entries remain retained; idempotent
+procedures bypass it.

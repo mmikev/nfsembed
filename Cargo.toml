@@ -18,49 +18,27 @@ include = ["src/**/*", "src/*", "examples/**/*", "tests/**/*", "benches/**/*", "
 doctest = false
 
 [dependencies]
-byteorder = "1.4"
-num-traits = "0.2"
-num-derive = "0.4"
-tokio = { version = "1", features = ["net", "io-util", "sync", "fs", "rt", "macros", "time"], default-features = false }
+tokio = { version = "1", features = ["net", "io-util", "sync", "rt", "macros", "time"], default-features = false }
 tracing = "0.1.31"
-anyhow = "1"
 async-trait = "0.1.9"
-filetime = "0.2"
 bytes = "1"
 hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"
 thiserror = "1"
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
-
-# demo
-tracing-subscriber = { version = "0.3", features = ["tracing-log"], optional = true }
-intaglio = { version = "1.6", optional = true }
-
 [dev-dependencies]
 criterion = { version = "0.8.2", default-features = false, features = ["async_tokio", "cargo_bench_support"] }
+# The host-filesystem examples use a multi-threaded runtime and tokio::fs.
+tokio = { version = "1", features = ["rt-multi-thread", "fs"] }
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+filetime = "0.2"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Storage_FileSystem"] }
 
 [features]
 strict = []
-demo = ["tracing-subscriber", "tokio/rt-multi-thread", "intaglio"]
-
-
-[[example]]
-name = "demo"
-required-features = ["demo"]
-path = "examples/demo.rs"
-
-[[example]]
-name = "mirrorfs"
-required-features = ["demo"]
-path = "examples/mirrorfs.rs"
-
-[[example]]
-name = "certification_server"
-path = "examples/certification_server.rs"
 
 [[bench]]
 name = "performance"

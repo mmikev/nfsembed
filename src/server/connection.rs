@@ -1,45 +1,52 @@
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Range;
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch, Mutex, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
 
+use super::limits::MAXIMUM_FIXED_REPLY_SIZE;
 use super::{AuthPolicy, ExecutionTracker, ExportState, PortmapperMode, ServerError, ServerLimits};
-use crate::handles::HandleCodec;
+use crate::handles::{HandleCodec, HandleError};
 use crate::mount3::codec::EncodeMountResult;
-use crate::mount3::types::{DumpResult, ExportEntry, ExportResult, MountEntry, MountResult, MountStatus};
-use crate::nfs3::codec::{encode_post_attributes, encode_readdir_entry, EncodeNfsResult};
+use crate::mount3::types::{DumpResult, ExportEntry, ExportResult, MountEntry, MountResult, MountStatus, MAX_PATH};
+use crate::nfs3::codec::{encode_post_attributes, encode_readdir_reply, EncodeNfsResult, ReadDirLimits};
+use crate::nfs3::dispatch::Procedure;
 use crate::nfs3::procedures::{
     AccessResult, CommitResult, CreateResult, DirectoryOperationArgs, FsInfoResult, FsStatResult, GetAttrResult,
-    LinkResult, LookupResult, NfsArguments, PathConfResult, ReadDirEntry, ReadDirEntryExtension, ReadDirResult,
-    ReadLinkResult, ReadResult, RenameResult, SetAttrResult, WccResult, WriteRequest, WriteResult,
+    LinkResult, LookupResult, NfsArguments, PathConfResult, ReadArgs, ReadDirEntry, ReadDirEntryExtension,
+    ReadDirResult, ReadLinkResult, ReadResult, RenameResult, SetAttrResult, WccResult, WriteRequest, WriteResult,
 };
 use crate::nfs3::types::{NfsStatus, WccData};
-use crate::replay::{ReplayCache, ReplayDecision, ReplayKey, RequestFingerprint};
-use crate::rpc::auth::{decode_principal, AUTH_NONE};
-use crate::rpc::codec::{DecodeError, Decoder, EncodeError, Encoder};
+use crate::replay::{ReplayDecision, ReplayKey, RequestFingerprint};
+use crate::rpc::auth::{decode_principal, AUTH_NONE, AUTH_SYS};
+use crate::rpc::codec::{Decoder, EncodeError};
+use crate::rpc::message::{self, AcceptStatus, AuthStatus, CallHeader, VersionRange, ACCEPTED_REPLY_HEADER_SIZE};
 use crate::rpc::record::{read_record_budgeted, validate_record_length, write_record_segments_limited, RecordLimits};
 use crate::rpc::reply::EncodedReply;
 use crate::vfs::{
-    ExportId, FileAttributes, FileType, MutationResult, NfsError, NfsName, ObjectKey, Principal, RequestContext,
-    VirtualFileSystem,
+    CreatedObject, ExportId, FileAttributes, FileType, FsInfo, MutationResult, NfsError, NfsName, ObjectKey, Principal,
+    RequestContext, VirtualFileSystem, WriteStability,
 };
 
-const RPC_CALL: u32 = 0;
-const RPC_REPLY: u32 = 1;
-const MSG_ACCEPTED: u32 = 0;
-const SUCCESS: u32 = 0;
-const PROG_UNAVAIL: u32 = 1;
-const PROG_MISMATCH: u32 = 2;
-const PROC_UNAVAIL: u32 = 3;
-const GARBAGE_ARGS: u32 = 4;
-const SYSTEM_ERR: u32 = 5;
+/// RFC 5531 `MAX_AUTH_BYTES`.
+const MAX_AUTH_BYTES: usize = 400;
+/// The six RFC 1813 `ACCESS3_*` bits.
+const ACCESS_MASK: u32 = 0x3f;
+/// RFC 1813 `FSINFO` property bits.
+const FSF3_LINK: u32 = 0x0001;
+const FSF3_SYMLINK: u32 = 0x0002;
+const FSF3_HOMOGENEOUS: u32 = 0x0008;
+const FSF3_CANSETTIME: u32 = 0x0010;
+/// The smallest READDIR `count` that can hold an empty listing.
+const MINIMUM_READDIR_COUNT: usize = 20;
 
 pub(crate) struct ConnectionState {
     pub exports: Arc<Vec<ExportState>>,
@@ -47,7 +54,7 @@ pub(crate) struct ConnectionState {
     pub auth_policy: AuthPolicy,
     pub portmapper: PortmapperMode,
     pub handles: HandleCodec,
-    pub replay: Arc<ReplayCache>,
+    pub replay: Arc<crate::replay::ReplayCache>,
     pub requests: Arc<Semaphore>,
     pub request_buffers: Arc<Semaphore>,
     pub reply_buffers: Arc<Semaphore>,
@@ -60,7 +67,7 @@ type MountTable = Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>>;
 
 struct QueuedRequest {
     record: Vec<u8>,
-    _budget: Arc<OwnedSemaphorePermit>,
+    budget: OwnedSemaphorePermit,
     deadline: Instant,
 }
 
@@ -76,11 +83,7 @@ pub(crate) async fn serve_connection(
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
     stream.set_nodelay(true)?;
-    let record_limits = RecordLimits {
-        max_record_size: state.limits.max_rpc_record_size,
-        max_fragment_size: state.limits.max_rpc_fragment_size,
-        max_fragments: state.limits.max_fragments_per_record,
-    };
+    let record_limits = state.limits.record_limits();
     let queue_capacity = state.limits.max_requests_per_connection;
     let (request_sender, request_receiver) = mpsc::channel(queue_capacity);
     let (reply_sender, reply_receiver) = mpsc::channel(queue_capacity);
@@ -105,8 +108,8 @@ async fn connection_reader(
     mut reader: OwnedReadHalf,
     sender: mpsc::Sender<QueuedRequest>,
     limits: RecordLimits,
-    idle_timeout: std::time::Duration,
-    progress_timeout: std::time::Duration,
+    idle_timeout: Duration,
+    progress_timeout: Duration,
     request_buffers: Arc<Semaphore>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServerError> {
@@ -115,7 +118,7 @@ async fn connection_reader(
             return Ok(());
         }
         let read = timeout(idle_timeout, read_record_budgeted(&mut reader, limits, request_buffers.clone()));
-        let (record, reservation) = tokio::select! {
+        let (record, budget) = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -141,7 +144,7 @@ async fn connection_reader(
             },
             result = timeout(progress_timeout, sender.send(QueuedRequest {
                 record,
-                _budget: Arc::new(reservation),
+                budget,
                 deadline: Instant::now() + progress_timeout,
             })) => {
                 match result {
@@ -177,57 +180,10 @@ async fn connection_processor(
                     receiver.close();
                 }
             },
-            record = receiver.recv(), if requests.len() < state.limits.max_requests_per_connection
+            request = receiver.recv(), if requests.len() < state.limits.max_requests_per_connection
                 && (!receiver.is_closed() || !receiver.is_empty()) => {
-                if let Some(record) = record {
-                    let state = state.clone();
-                    let reply_sender = reply_sender.clone();
-                    requests.spawn(async move {
-                        let deadline = record.deadline;
-                        let xid = record
-                            .record
-                            .get(..4)
-                            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-                            .map(u32::from_be_bytes);
-                        let reply_budget = Arc::new(timeout_at(
-                            deadline,
-                            state
-                                .reply_buffers
-                                .clone()
-                                .acquire_many_owned(state.limits.max_rpc_record_size as u32),
-                        )
-                        .await
-                        .map_err(|_| ServerError::RequestTimeout)?
-                        .map_err(|_| ServerError::ShuttingDown)?);
-                        let reply = dispatch_record(
-                            record,
-                            client_addr,
-                            state.clone(),
-                            reply_budget.clone(),
-                            deadline,
-                        )
-                        .await;
-                        let reply = match reply {
-                            Ok(reply) => reply,
-                            Err(error) => {
-                                tracing::debug!(client = %client_addr, error = %error, "RPC request rejected");
-                                error_reply(xid, SYSTEM_ERR)
-                            },
-                        };
-                        match timeout_at(
-                            deadline,
-                            reply_sender.send(QueuedReply {
-                                reply,
-                                _budget: reply_budget,
-                            }),
-                        )
-                        .await
-                        {
-                            Ok(Ok(())) | Ok(Err(_)) => {},
-                            Err(_) => return Err(ServerError::RequestTimeout),
-                        }
-                        Ok::<(), ServerError>(())
-                    });
+                if let Some(request) = request {
+                    requests.spawn(handle_request(request, client_addr, state.clone(), reply_sender.clone()));
                 }
             },
             joined = requests.join_next(), if !requests.is_empty() => {
@@ -243,7 +199,7 @@ async fn connection_writer(
     mut writer: OwnedWriteHalf,
     mut receiver: mpsc::Receiver<QueuedReply>,
     limits: RecordLimits,
-    progress_timeout: std::time::Duration,
+    progress_timeout: Duration,
 ) -> Result<(), ServerError> {
     while let Some(reply) = receiver.recv().await {
         match timeout(progress_timeout, write_record_segments_limited(&mut writer, reply.reply.segments(), limits))
@@ -256,89 +212,192 @@ async fn connection_writer(
     Ok(())
 }
 
-async fn dispatch_record(
+/// The fixed RPC call header plus the locations of the credential body and
+/// the procedure arguments within the record.
+struct RpcCall {
+    header: CallHeader,
+    credential_flavor: u32,
+    credential: Range<usize>,
+    verifier_is_none: bool,
+    arguments_offset: usize,
+}
+
+impl RpcCall {
+    fn decode(record: &[u8]) -> Result<Self, ServerError> {
+        let mut decoder = Decoder::new(record);
+        let xid = decoder.read_u32()?;
+        if decoder.read_u32()? != message::CALL {
+            return Err(ServerError::Protocol("received an RPC reply on a server connection"));
+        }
+        let rpc_version = decoder.read_u32()?;
+        let program = decoder.read_u32()?;
+        let version = decoder.read_u32()?;
+        let procedure = decoder.read_u32()?;
+        let credential_flavor = decoder.read_u32()?;
+        let credential_start = decoder.position() + 4;
+        let credential_length = decoder.read_opaque_slice("RPC credential", MAX_AUTH_BYTES)?.len();
+        let verifier_flavor = decoder.read_u32()?;
+        let verifier = decoder.read_opaque_slice("RPC verifier", MAX_AUTH_BYTES)?;
+        Ok(Self {
+            header: CallHeader {
+                xid,
+                rpc_version,
+                program,
+                version,
+                procedure,
+            },
+            credential_flavor,
+            credential: credential_start..credential_start + credential_length,
+            verifier_is_none: verifier_flavor == AUTH_NONE && verifier.is_empty(),
+            arguments_offset: decoder.position(),
+        })
+    }
+}
+
+/// Runs one queued call to completion: reserves the reply bytes it may need,
+/// dispatches it, and queues its reply for the connection writer.
+async fn handle_request(
     request: QueuedRequest,
     client_addr: SocketAddr,
     state: Arc<ConnectionState>,
-    reply_budget: Arc<OwnedSemaphorePermit>,
-    deadline: Instant,
-) -> Result<EncodedReply, ServerError> {
+    reply_sender: mpsc::Sender<QueuedReply>,
+) -> Result<(), ServerError> {
     let QueuedRequest {
         record,
-        _budget: request_budget,
-        deadline: _,
+        budget: request_budget,
+        deadline,
     } = request;
     let record = Bytes::from(record);
-    let mut decoder = Decoder::new(&record);
-    let xid = decoder.read_u32()?;
-    if decoder.read_u32()? != RPC_CALL {
-        return Err(ServerError::Protocol("received an RPC reply on a server connection"));
-    }
-    let rpc_version = decoder.read_u32()?;
-    let program = decoder.read_u32()?;
-    let version = decoder.read_u32()?;
-    let procedure = decoder.read_u32()?;
-    let credential_flavor = decoder.read_u32()?;
-    let credential_body = decoder.read_opaque_slice("RPC credential", 400)?;
-    let verifier_flavor = decoder.read_u32()?;
-    let verifier = decoder.read_opaque_slice("RPC verifier", 400)?;
-    if verifier_flavor != AUTH_NONE || !verifier.is_empty() {
-        return Ok(auth_error(xid, 3).into());
-    }
-    let args_offset = decoder.position();
-    let principal = match decode_principal(credential_flavor, credential_body) {
-        Ok(principal) => principal,
-        Err(_) => return Ok(auth_error(xid, 1).into()),
-    };
-    let request_export_id = request_export_id(program, procedure, &record[args_offset..], &state);
-
-    if rpc_version != 2 {
-        return Ok(rpc_mismatch(xid, 2, 2).into());
-    }
-    if program != crate::portmap::PROGRAM && !principal_allowed(state.auth_policy, &principal) {
-        return Ok(auth_error(xid, 5).into());
-    }
-
-    let mut hasher = Sha256::new();
-    hasher.update(program.to_be_bytes());
-    hasher.update(version.to_be_bytes());
-    hasher.update(procedure.to_be_bytes());
-    hasher.update(&record[args_offset..]);
-    hash_principal(&mut hasher, &principal);
-    let fingerprint = RequestFingerprint(hasher.finalize().into());
-    let replay_key = ReplayKey {
-        client_addr: SocketAddr::new(client_addr.ip(), 0),
-        export_id: request_export_id,
-        xid,
-    };
-    let lease = match state.replay.begin(replay_key, fingerprint).await? {
-        ReplayDecision::Replay(reply) => {
-            tracing::debug!(xid, client = %client_addr, replay = "hit", "RPC reply replayed");
-            return Ok(reply);
+    let xid = record
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map_or(0, u32::from_be_bytes);
+    let call = RpcCall::decode(&record);
+    let reservation = match &call {
+        Ok(call) => {
+            let CallHeader {
+                program,
+                version,
+                procedure,
+                ..
+            } = call.header;
+            state
+                .limits
+                .reply_reservation(program, version, procedure, &record[call.arguments_offset..])
         },
-        ReplayDecision::Wait(waiter) => {
-            tracing::debug!(xid, client = %client_addr, replay = "wait", "waiting for in-flight duplicate");
-            return match timeout_at(deadline, waiter).await {
-                Ok(reply) => Ok(reply??),
-                Err(_) => {
-                    tracing::warn!(client = %client_addr, xid, "duplicate RPC request timed out");
-                    Err(ServerError::RequestTimeout)
-                },
+        Err(_) => MAXIMUM_FIXED_REPLY_SIZE,
+    };
+    // Reservations never exceed the record limit, which is validated to fit
+    // in a `u32`.
+    let reply_budget = timeout_at(deadline, state.reply_buffers.clone().acquire_many_owned(reservation as u32))
+        .await
+        .map_err(|_| ServerError::RequestTimeout)?
+        .map_err(|_| ServerError::ShuttingDown)?;
+    let reply_budget = Arc::new(reply_budget);
+    let reply = match call {
+        Ok(call) => {
+            let execution = Execution {
+                request_budget,
+                reply_budget: reply_budget.clone(),
+                reply_limit: reservation,
+                deadline,
             };
+            dispatch_record(record, call, client_addr, &state, execution).await
         },
-        ReplayDecision::Execute(lease) => {
-            tracing::trace!(xid, client = %client_addr, replay = "miss", "new RPC request");
-            lease
-        },
+        Err(error) => Err(error),
+    };
+    let reply = reply.unwrap_or_else(|error| {
+        tracing::debug!(client = %client_addr, error = %error, "RPC request rejected");
+        message::accepted_reply(xid, AcceptStatus::SystemError, &[]).into()
+    });
+    let queued = QueuedReply {
+        reply,
+        _budget: reply_budget,
+    };
+    // A closed reply channel only means that the connection already ended.
+    match timeout_at(deadline, reply_sender.send(queued)).await {
+        Ok(_) => Ok(()),
+        Err(_) => Err(ServerError::RequestTimeout),
+    }
+}
+
+/// Resources that a call's tracked execution holds until it finishes.
+struct Execution {
+    request_budget: OwnedSemaphorePermit,
+    reply_budget: Arc<OwnedSemaphorePermit>,
+    reply_limit: usize,
+    deadline: Instant,
+}
+
+async fn dispatch_record(
+    record: Bytes,
+    call: RpcCall,
+    client_addr: SocketAddr,
+    state: &Arc<ConnectionState>,
+    execution: Execution,
+) -> Result<EncodedReply, ServerError> {
+    let header = call.header;
+    let xid = header.xid;
+    if !call.verifier_is_none {
+        return Ok(message::auth_error(xid, AuthStatus::BadVerifier).into());
+    }
+    let Ok(principal) = decode_principal(call.credential_flavor, &record[call.credential]) else {
+        return Ok(message::auth_error(xid, AuthStatus::BadCredential).into());
+    };
+    if header.rpc_version != message::RPC_VERSION {
+        return Ok(message::rpc_mismatch(xid).into());
+    }
+    if header.program != crate::portmap::PROGRAM && !principal_allowed(state.auth_policy, &principal) {
+        return Ok(message::auth_error(xid, AuthStatus::TooWeak).into());
+    }
+
+    let arguments = record.slice(call.arguments_offset..);
+    let export_id = request_export_id(header.program, header.procedure, &arguments, state);
+    let lease = if requires_replay_protection(header) {
+        let replay_key = ReplayKey {
+            client_addr: SocketAddr::new(client_addr.ip(), 0),
+            export_id,
+            xid,
+        };
+        match state
+            .replay
+            .begin(replay_key, request_fingerprint(header, &arguments, &principal))?
+        {
+            ReplayDecision::Replay(reply) => {
+                tracing::debug!(xid, client = %client_addr, replay = "hit", "RPC reply replayed");
+                return Ok(reply);
+            },
+            ReplayDecision::Wait(waiter) => {
+                tracing::debug!(xid, client = %client_addr, replay = "wait", "waiting for in-flight duplicate");
+                return match timeout_at(execution.deadline, waiter).await {
+                    Ok(reply) => Ok(reply??),
+                    Err(_) => {
+                        tracing::warn!(client = %client_addr, xid, "duplicate RPC request timed out");
+                        Err(ServerError::RequestTimeout)
+                    },
+                };
+            },
+            ReplayDecision::Execute(lease) => {
+                tracing::trace!(xid, client = %client_addr, replay = "miss", "new RPC request");
+                Some(lease)
+            },
+        }
+    } else {
+        None
     };
 
     let context = RequestContext {
         principal,
         client_addr,
-        export_id: request_export_id,
+        export_id,
     };
-    let arguments = record.slice(args_offset..);
     let request_bytes = record.len();
+    let Execution {
+        request_budget,
+        reply_budget,
+        reply_limit,
+        deadline,
+    } = execution;
     let permit = match timeout_at(deadline, state.requests.clone().acquire_owned()).await {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => return Err(ServerError::ShuttingDown),
@@ -347,67 +406,75 @@ async fn dispatch_record(
             return Err(ServerError::RequestTimeout);
         },
     };
-    let execution_state = state.clone();
-    let (send, receive) = tokio::sync::oneshot::channel();
     let executions = state.executions.upgrade().ok_or(ServerError::ShuttingDown)?;
-    executions
-        .spawn(async move {
-            let _permit = permit;
-            // The execution tracker outlives a disconnected connection. Keep
-            // both aggregate buffer charges until its request bytes and any
-            // constructed reply have been released.
-            let _request_budget = request_budget;
-            let _reply_budget = reply_budget;
-            let result = match timeout_at(
-                deadline,
-                execute_request(
-                    xid,
-                    program,
-                    version,
-                    procedure,
-                    arguments,
-                    context,
-                    client_addr,
-                    request_bytes,
-                    execution_state,
-                ),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    tracing::warn!(client = %client_addr, xid, "RPC execution reached its deadline and was cancelled");
-                    Err(ServerError::RequestTimeout)
-                },
-            };
-            match result {
-                Ok(reply) => {
-                    lease.complete(reply.clone());
-                    let _ = send.send(Ok(reply));
-                },
-                Err(error) => {
-                    lease.cancel();
-                    let _ = send.send(Err(error));
-                },
+    let execution_state = state.clone();
+    let (send, receive) = oneshot::channel();
+    executions.spawn(async move {
+        // The execution tracker outlives a disconnected connection. Keep
+        // both aggregate buffer charges until its request bytes and any
+        // constructed reply have been released.
+        let _permit = permit;
+        let _request_budget = request_budget;
+        let _reply_budget = reply_budget;
+        let execution = execute_request(header, arguments, context, request_bytes, reply_limit, execution_state);
+        let result = match timeout_at(deadline, execution).await {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!(client = %client_addr, xid, "RPC execution reached its deadline and was cancelled");
+                Err(ServerError::RequestTimeout)
+            },
+        };
+        // Store the reply before callers attempt socket delivery so that a
+        // retransmission after a lost reply replays it.
+        if let Some(lease) = lease {
+            match &result {
+                Ok(reply) => lease.complete(reply.clone()),
+                Err(_) => lease.cancel(),
             }
-        })
-        .await;
-
+        }
+        let _ = send.send(result);
+    });
+    drop(executions);
     receive.await?
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Only non-idempotent NFS procedures pass through the duplicate-request
+/// cache. Idempotent calls, including every MOUNT and portmapper call, are
+/// executed again when retransmitted, so bulk READ and READDIR payloads are
+/// never fingerprinted, copied into, or retained by the cache.
+fn requires_replay_protection(header: CallHeader) -> bool {
+    header.program == crate::nfs3::types::PROGRAM
+        && header.version == crate::nfs3::types::VERSION
+        && Procedure::from_wire(header.procedure).is_some_and(Procedure::is_non_idempotent)
+}
+
+fn request_fingerprint(header: CallHeader, arguments: &[u8], principal: &Principal) -> RequestFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(header.program.to_be_bytes());
+    hasher.update(header.version.to_be_bytes());
+    hasher.update(header.procedure.to_be_bytes());
+    hasher.update(arguments);
+    hash_principal(&mut hasher, principal);
+    RequestFingerprint(hasher.finalize().into())
+}
+
 async fn execute_request(
-    xid: u32,
-    program: u32,
-    version: u32,
-    procedure: u32,
+    header: CallHeader,
     arguments: Bytes,
     context: RequestContext,
-    client_addr: SocketAddr,
     request_bytes: usize,
+    reply_limit: usize,
     state: Arc<ConnectionState>,
 ) -> Result<EncodedReply, ServerError> {
+    let CallHeader {
+        xid,
+        program,
+        version,
+        procedure,
+        ..
+    } = header;
+    let client_addr = context.client_addr;
+    let procedure_name = procedure_name(program, procedure);
     let started_at = std::time::Instant::now();
     let span = tracing::info_span!(
         "rpc_request",
@@ -416,35 +483,31 @@ async fn execute_request(
         program,
         version,
         procedure,
-        procedure_name = procedure_name(program, procedure),
+        procedure_name,
         request_bytes,
     );
-    let reply = match dispatch_call(xid, program, version, procedure, &arguments, &context, &state)
-        .instrument(span)
-        .await
-    {
+    let reply = match dispatch_call(header, &arguments, &context, &state).instrument(span).await {
         Ok(reply) => reply,
-        Err(ServerError::Decode(_)) => accepted_reply(xid, GARBAGE_ARGS, &[]).into(),
+        Err(ServerError::Decode(_)) => message::accepted_reply(xid, AcceptStatus::GarbageArguments, &[]).into(),
         Err(ServerError::Encode(error)) => {
             tracing::warn!(client = %client_addr, xid, error = %error, "RPC result could not be encoded");
-            accepted_reply(xid, SYSTEM_ERR, &[]).into()
+            message::accepted_reply(xid, AcceptStatus::SystemError, &[]).into()
         },
         Err(error) => return Err(error),
     };
+    // The reply must fit the transport and the reply-buffer bytes reserved
+    // for this call before it executed.
     let limits = RecordLimits {
-        max_record_size: state.limits.max_rpc_record_size,
-        max_fragment_size: state.limits.max_rpc_fragment_size,
-        max_fragments: state.limits.max_fragments_per_record,
+        max_record_size: reply_limit,
+        ..state.limits.record_limits()
     };
     if let Err(error) = validate_record_length(reply.len(), limits) {
         tracing::warn!(client = %client_addr, xid, error = %error, "RPC result exceeded outbound limits");
-        let bounded_error = EncodedReply::from(accepted_reply(xid, SYSTEM_ERR, &[]));
-        validate_record_length(bounded_error.len(), limits)?;
-        return Ok(bounded_error);
+        return Ok(message::accepted_reply(xid, AcceptStatus::SystemError, &[]).into());
     }
     let reply_prefix = reply.prefix();
     let protocol_status = if (program == crate::nfs3::types::PROGRAM || program == crate::mount3::types::PROGRAM)
-        && reply_prefix.len() >= 28
+        && reply_prefix.len() >= ACCEPTED_REPLY_HEADER_SIZE + 4
     {
         u32::from_be_bytes(reply_prefix[24..28].try_into().unwrap_or_default())
     } else {
@@ -453,7 +516,7 @@ async fn execute_request(
     tracing::debug!(
         xid,
         client = %client_addr,
-        procedure = procedure_name(program, procedure),
+        procedure = procedure_name,
         duration_micros = started_at.elapsed().as_micros(),
         protocol_status,
         request_bytes,
@@ -487,35 +550,9 @@ fn hash_principal(hasher: &mut Sha256, principal: &Principal) {
 }
 
 fn procedure_name(program: u32, procedure: u32) -> &'static str {
-    if program == crate::nfs3::types::PROGRAM {
-        return match procedure {
-            0 => "NULL",
-            1 => "GETATTR",
-            2 => "SETATTR",
-            3 => "LOOKUP",
-            4 => "ACCESS",
-            5 => "READLINK",
-            6 => "READ",
-            7 => "WRITE",
-            8 => "CREATE",
-            9 => "MKDIR",
-            10 => "SYMLINK",
-            11 => "MKNOD",
-            12 => "REMOVE",
-            13 => "RMDIR",
-            14 => "RENAME",
-            15 => "LINK",
-            16 => "READDIR",
-            17 => "READDIRPLUS",
-            18 => "FSSTAT",
-            19 => "FSINFO",
-            20 => "PATHCONF",
-            21 => "COMMIT",
-            _ => "UNKNOWN_NFS",
-        };
-    }
-    if program == crate::mount3::types::PROGRAM {
-        return match procedure {
+    match program {
+        crate::nfs3::types::PROGRAM => Procedure::from_wire(procedure).map_or("UNKNOWN_NFS", Procedure::name),
+        crate::mount3::types::PROGRAM => match procedure {
             0 => "MOUNT_NULL",
             1 => "MNT",
             2 => "DUMP",
@@ -523,31 +560,29 @@ fn procedure_name(program: u32, procedure: u32) -> &'static str {
             4 => "UMNTALL",
             5 => "EXPORT",
             _ => "UNKNOWN_MOUNT",
-        };
-    }
-    if program == crate::portmap::PROGRAM {
-        return match procedure {
+        },
+        crate::portmap::PROGRAM => match procedure {
             0 => "PMAP_NULL",
             3 => "GETPORT",
             _ => "UNKNOWN_PORTMAP",
-        };
+        },
+        _ => "UNKNOWN_RPC",
     }
-    "UNKNOWN_RPC"
 }
 
+/// Selects the export a call addresses, for routing and replay keys. NFS
+/// calls use the export ID inside their first file handle without verifying
+/// its tag; `decode_object` authenticates every handle before the VFS sees it.
 fn request_export_id(program: u32, procedure: u32, args: &[u8], state: &ConnectionState) -> ExportId {
-    if program == crate::nfs3::types::PROGRAM && procedure != 0 {
-        let mut decoder = Decoder::new(args);
-        if let Ok(handle) = decoder.read_opaque_slice("NFS file handle", 64) {
-            if let Ok((export_id, _)) = state.handles.decode_any(handle) {
-                return export_id;
-            }
-        }
-        return state.exports.first().map_or(ExportId(0), |export| export.id);
+    if program == crate::nfs3::types::PROGRAM && procedure != Procedure::Null as u32 {
+        let handle = Decoder::new(args).read_opaque_slice("NFS file handle", 64);
+        return handle
+            .ok()
+            .and_then(|handle| state.handles.peek_export(handle).ok())
+            .unwrap_or_else(|| state.exports.first().map_or(ExportId(0), |export| export.id));
     }
     if program == crate::mount3::types::PROGRAM && matches!(procedure, 1 | 3) {
-        let mut decoder = Decoder::new(args);
-        if let Ok(path) = decoder.read_opaque_slice("MOUNT path", 1024) {
+        if let Ok(path) = Decoder::new(args).read_opaque_slice("MOUNT path", MAX_PATH) {
             if let Some(export) = select_export(state, path) {
                 return export.id;
             }
@@ -560,39 +595,69 @@ fn select_export<'a>(state: &'a ConnectionState, requested: &[u8]) -> Option<&'a
     state
         .exports
         .iter()
-        .filter(|export| export_matches(&export.path, requested))
+        .filter(|export| crate::mount3::dispatch::export_matches(export.path.as_bytes(), requested))
         .max_by_key(|export| export.path.len())
 }
 
 async fn dispatch_call(
-    xid: u32,
-    program: u32,
-    version: u32,
-    procedure: u32,
+    header: CallHeader,
     args: &Bytes,
     context: &RequestContext,
     state: &ConnectionState,
 ) -> Result<EncodedReply, ServerError> {
+    let CallHeader {
+        xid,
+        program,
+        version,
+        procedure,
+        ..
+    } = header;
     match program {
         crate::nfs3::types::PROGRAM => {
             if version != crate::nfs3::types::VERSION {
-                return Ok(program_mismatch(xid, crate::nfs3::types::VERSION, crate::nfs3::types::VERSION).into());
+                return Ok(message::program_mismatch(xid, VersionRange::exact(crate::nfs3::types::VERSION)).into());
             }
             dispatch_nfs(xid, procedure, args, context, state).await
         },
         crate::mount3::types::PROGRAM => {
             if version != crate::mount3::types::VERSION {
-                return Ok(program_mismatch(xid, crate::mount3::types::VERSION, crate::mount3::types::VERSION).into());
+                return Ok(message::program_mismatch(xid, VersionRange::exact(crate::mount3::types::VERSION)).into());
             }
             dispatch_mount(xid, procedure, args, context, state).await.map(Into::into)
         },
         crate::portmap::PROGRAM if state.portmapper == PortmapperMode::Enabled => {
             if version != crate::portmap::VERSION {
-                return Ok(program_mismatch(xid, crate::portmap::VERSION, crate::portmap::VERSION).into());
+                return Ok(message::program_mismatch(xid, VersionRange::exact(crate::portmap::VERSION)).into());
             }
             dispatch_portmap(xid, procedure, args, state).map(Into::into)
         },
-        _ => Ok(accepted_reply(xid, PROG_UNAVAIL, &[]).into()),
+        _ => Ok(message::accepted_reply(xid, AcceptStatus::ProgramUnavailable, &[]).into()),
+    }
+}
+
+/// Why an NFS call ended without its procedure-specific reply.
+enum NfsFailure {
+    /// The call failed before or inside the VFS with a status whose result arm
+    /// carries no post-operation data; `nfs_failure_reply` encodes it.
+    Status(NfsStatus),
+    Server(ServerError),
+}
+
+impl From<NfsStatus> for NfsFailure {
+    fn from(status: NfsStatus) -> Self {
+        Self::Status(status)
+    }
+}
+
+impl From<NfsError> for NfsFailure {
+    fn from(error: NfsError) -> Self {
+        Self::Status(error.into())
+    }
+}
+
+impl From<EncodeError> for NfsFailure {
+    fn from(error: EncodeError) -> Self {
+        Self::Server(error.into())
     }
 }
 
@@ -603,602 +668,269 @@ async fn dispatch_nfs(
     context: &RequestContext,
     state: &ConnectionState,
 ) -> Result<EncodedReply, ServerError> {
-    if procedure > 21 {
-        return Ok(accepted_reply(xid, PROC_UNAVAIL, &[]).into());
-    }
-    if procedure == 7 {
-        let arguments = WriteRequest::decode(args.clone(), state.limits.max_rpc_record_size)?;
-        let Some(export) = state.exports.iter().find(|export| export.id == context.export_id) else {
-            return Ok(nfs_failure_reply_for_procedure(xid, procedure, NfsStatus::BadHandle)?.into());
-        };
-        return Ok(dispatch_write(xid, arguments, context, state, export.vfs.as_ref())
-            .await?
-            .into());
-    }
-    let arguments = NfsArguments::decode(procedure, args, state.limits.max_rpc_record_size)?;
-    if matches!(arguments, NfsArguments::Null) {
-        return Ok(accepted_reply(xid, SUCCESS, &[]).into());
-    }
-    let Some(export) = state.exports.iter().find(|export| export.id == context.export_id) else {
-        return Ok(nfs_failure_reply_for_procedure(xid, procedure, NfsStatus::BadHandle)?.into());
+    let Some(procedure) = Procedure::from_wire(procedure) else {
+        return Ok(message::accepted_reply(xid, AcceptStatus::ProcedureUnavailable, &[]).into());
     };
-    let vfs = &export.vfs;
+    let max_variable_size = state.limits.max_rpc_record_size;
+    let result = if procedure == Procedure::Write {
+        // WRITE data stays a zero-copy slice of the retained RPC record.
+        let arguments = WriteRequest::decode(args.clone(), max_variable_size)?;
+        match export_vfs(state, context.export_id) {
+            Ok(vfs) => dispatch_write(xid, arguments, context, state, vfs).await,
+            Err(status) => Err(status.into()),
+        }
+    } else {
+        let arguments = NfsArguments::decode(procedure as u32, args, max_variable_size)?;
+        execute_nfs(xid, arguments, context, state).await
+    };
+    match result {
+        Ok(reply) => Ok(reply),
+        Err(NfsFailure::Status(status)) => Ok(nfs_failure_reply(xid, procedure, status)?.into()),
+        Err(NfsFailure::Server(error)) => Err(error),
+    }
+}
+
+fn export_vfs(state: &ConnectionState, export_id: ExportId) -> Result<&dyn VirtualFileSystem, NfsStatus> {
+    state
+        .exports
+        .iter()
+        .find(|export| export.id == export_id)
+        .map(|export| export.vfs.as_ref())
+        .ok_or(NfsStatus::BadHandle)
+}
+
+async fn execute_nfs(
+    xid: u32,
+    arguments: NfsArguments,
+    context: &RequestContext,
+    state: &ConnectionState,
+) -> Result<EncodedReply, NfsFailure> {
+    let vfs = match arguments {
+        NfsArguments::Null => return Ok(message::accepted_reply(xid, AcceptStatus::Success, &[]).into()),
+        _ => export_vfs(state, context.export_id)?,
+    };
     let reply = match arguments {
+        NfsArguments::Null => message::accepted_reply(xid, AcceptStatus::Success, &[]),
         NfsArguments::GetAttr(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &GetAttrResult::Err {
-                            status: wire_nfs_status(status)?,
-                        },
-                    )?
-                    .into())
-                },
-            };
-            let result = match vfs.getattr(context, object).await {
-                Ok(attributes) => GetAttrResult::Ok { attributes },
-                Err(error) => GetAttrResult::Err { status: error.into() },
-            };
-            typed_nfs_reply(xid, &result)?
+            let object = decode_object(state, context, &arguments.object)?;
+            let attributes = vfs.getattr(context, object).await?;
+            nfs_reply(xid, &GetAttrResult::Ok { attributes })?
         },
         NfsArguments::SetAttr(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &SetAttrResult::Err {
-                            status: wire_nfs_status(status)?,
-                            object_wcc: WccData::default(),
-                        },
-                    )?
-                    .into())
-                },
-            };
-            let result = match vfs.setattr(context, object, arguments.attributes, arguments.guard).await {
-                Ok(result) => SetAttrResult::Ok {
-                    object_wcc: WccData {
-                        before: result.before,
-                        after: result.after,
-                    },
-                },
-                Err(error) => SetAttrResult::Err {
-                    status: error.into(),
-                    object_wcc: WccData::default(),
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            let object = decode_object(state, context, &arguments.object)?;
+            let result = vfs.setattr(context, object, arguments.attributes, arguments.guard).await?;
+            let ((), object_wcc) = split_wcc(result);
+            nfs_reply(xid, &SetAttrResult::Ok { object_wcc })?
         },
         NfsArguments::Lookup(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &LookupResult::Err {
-                            status: wire_nfs_status(status)?,
-                            directory_attributes: None,
-                        },
-                    )?
-                    .into())
+            let (parent, name) = decode_directory_operation(state, context, arguments)?;
+            let found = vfs.lookup(context, parent, &name).await;
+            let directory_attributes = vfs.getattr(context, parent).await.ok();
+            let result = match found {
+                Ok(found) => LookupResult::Ok {
+                    object_handle: encode_handle(state, context, found.object),
+                    object_attributes: found.attributes,
+                    directory_attributes,
+                },
+                Err(error) => LookupResult::Err {
+                    status: error.into(),
+                    directory_attributes,
                 },
             };
-            let result = match vfs.lookup(context, parent, &name).await {
-                Ok(found) => {
-                    let parent_attributes = vfs.getattr(context, parent).await.ok();
-                    LookupResult::Ok {
-                        object_handle: state.handles.encode(context.export_id, found.object).to_vec(),
-                        object_attributes: found.attributes,
-                        directory_attributes: parent_attributes,
-                    }
-                },
-                Err(error) => {
-                    let parent_attributes = vfs.getattr(context, parent).await.ok();
-                    LookupResult::Err {
-                        status: error.into(),
-                        directory_attributes: parent_attributes,
-                    }
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            nfs_reply(xid, &result)?
         },
         NfsArguments::Access(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &AccessResult::Err {
-                            status: wire_nfs_status(status)?,
-                            attributes: None,
-                        },
-                    )?
-                    .into())
-                },
-            };
-            const ACCESS_MASK: u32 = 0x3f;
+            let object = decode_object(state, context, &arguments.object)?;
             let requested = arguments.requested & ACCESS_MASK;
-            let result = match vfs.access(context, object, requested).await {
-                Ok(allowed) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    AccessResult::Ok {
-                        attributes,
-                        access: allowed & requested & ACCESS_MASK,
-                    }
+            let allowed = vfs.access(context, object, requested).await;
+            let attributes = vfs.getattr(context, object).await.ok();
+            let result = match allowed {
+                Ok(allowed) => AccessResult::Ok {
+                    attributes,
+                    access: allowed & requested,
                 },
-                Err(error) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    AccessResult::Err {
-                        status: error.into(),
-                        attributes,
-                    }
+                Err(error) => AccessResult::Err {
+                    status: error.into(),
+                    attributes,
                 },
             };
-            typed_nfs_reply(xid, &result)?
+            nfs_reply(xid, &result)?
         },
         NfsArguments::ReadLink(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &ReadLinkResult::Err {
-                            status: wire_nfs_status(status)?,
-                            attributes: None,
-                        },
-                    )?
-                    .into())
+            let object = decode_object(state, context, &arguments.object)?;
+            let path = vfs.readlink(context, object).await;
+            let attributes = vfs.getattr(context, object).await.ok();
+            let result = match path {
+                Ok(path) => ReadLinkResult::Ok { attributes, path },
+                Err(error) => ReadLinkResult::Err {
+                    status: error.into(),
+                    attributes,
                 },
             };
-            match vfs.readlink(context, object).await {
-                Ok(path) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    typed_nfs_reply(xid, &ReadLinkResult::Ok { attributes, path })?
-                },
-                Err(error) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    typed_nfs_reply(
-                        xid,
-                        &ReadLinkResult::Err {
-                            status: error.into(),
-                            attributes,
-                        },
-                    )?
-                },
-            }
+            nfs_reply(xid, &result)?
         },
-        NfsArguments::Read(arguments) => {
-            return dispatch_read(xid, arguments, context, state, vfs.as_ref()).await;
-        },
-        NfsArguments::Write(arguments) => {
-            return Ok(dispatch_write(xid, arguments.into(), context, state, vfs.as_ref())
-                .await?
-                .into());
-        },
+        NfsArguments::Read(arguments) => return dispatch_read(xid, arguments, context, state, vfs).await,
+        NfsArguments::Write(arguments) => return dispatch_write(xid, arguments.into(), context, state, vfs).await,
         NfsArguments::Create(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments.target, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return create_failure_reply(xid, status).map(Into::into),
-            };
-            create_reply(
-                xid,
-                state,
-                context.export_id,
-                vfs.create(context, parent, &name, arguments.attributes, arguments.mode).await,
-            )?
+            let (parent, name) = decode_directory_operation(state, context, arguments.target)?;
+            let created = vfs.create(context, parent, &name, arguments.attributes, arguments.mode).await?;
+            create_reply(xid, state, context, created)?
         },
         NfsArguments::Mkdir(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments.target, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return create_failure_reply(xid, status).map(Into::into),
-            };
-            create_reply(xid, state, context.export_id, vfs.mkdir(context, parent, &name, arguments.attributes).await)?
+            let (parent, name) = decode_directory_operation(state, context, arguments.target)?;
+            let created = vfs.mkdir(context, parent, &name, arguments.attributes).await?;
+            create_reply(xid, state, context, created)?
         },
         NfsArguments::Symlink(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments.target, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return create_failure_reply(xid, status).map(Into::into),
-            };
-            create_reply(
-                xid,
-                state,
-                context.export_id,
-                vfs.symlink(context, parent, &name, &arguments.path, arguments.attributes).await,
-            )?
+            let (parent, name) = decode_directory_operation(state, context, arguments.target)?;
+            let created = vfs
+                .symlink(context, parent, &name, &arguments.path, arguments.attributes)
+                .await?;
+            create_reply(xid, state, context, created)?
         },
         NfsArguments::Mknod(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments.target, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return create_failure_reply(xid, status).map(Into::into),
-            };
-            create_reply(
-                xid,
-                state,
-                context.export_id,
-                vfs.mknod(context, parent, &name, arguments.node_type, arguments.attributes)
-                    .await,
-            )?
+            let (parent, name) = decode_directory_operation(state, context, arguments.target)?;
+            let created = vfs
+                .mknod(context, parent, &name, arguments.node_type, arguments.attributes)
+                .await?;
+            create_reply(xid, state, context, created)?
         },
         NfsArguments::Remove(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &WccResult::Err {
-                            status: wire_nfs_status(status)?,
-                            object_wcc: WccData::default(),
-                        },
-                    )?
-                    .into())
-                },
-            };
-            mutation_void_reply(xid, vfs.remove(context, parent, &name).await)?
+            let (parent, name) = decode_directory_operation(state, context, arguments)?;
+            let ((), object_wcc) = split_wcc(vfs.remove(context, parent, &name).await?);
+            nfs_reply(xid, &WccResult::Ok { object_wcc })?
         },
         NfsArguments::Rmdir(arguments) => {
-            let (parent, name) = match decode_directory_operation(arguments, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &WccResult::Err {
-                            status: wire_nfs_status(status)?,
-                            object_wcc: WccData::default(),
-                        },
-                    )?
-                    .into())
-                },
-            };
-            mutation_void_reply(xid, vfs.rmdir(context, parent, &name).await)?
+            let (parent, name) = decode_directory_operation(state, context, arguments)?;
+            let ((), object_wcc) = split_wcc(vfs.rmdir(context, parent, &name).await?);
+            nfs_reply(xid, &WccResult::Ok { object_wcc })?
         },
         NfsArguments::Rename(arguments) => {
-            let (from_parent, from_name) = match decode_directory_operation(arguments.from, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return rename_failure_reply(xid, status).map(Into::into),
-            };
-            let (to_parent, to_name) = match decode_directory_operation(arguments.to, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return rename_failure_reply(xid, status).map(Into::into),
-            };
-            match vfs.rename(context, from_parent, &from_name, to_parent, &to_name).await {
-                Ok((from, to)) => typed_nfs_reply(
-                    xid,
-                    &RenameResult::Ok {
-                        from_directory_wcc: WccData {
-                            before: from.before,
-                            after: from.after,
-                        },
-                        to_directory_wcc: WccData {
-                            before: to.before,
-                            after: to.after,
-                        },
-                    },
-                )?,
-                Err(error) => typed_nfs_reply(
-                    xid,
-                    &RenameResult::Err {
-                        status: error.into(),
-                        from_directory_wcc: WccData::default(),
-                        to_directory_wcc: WccData::default(),
-                    },
-                )?,
-            }
+            let (from_parent, from_name) = decode_directory_operation(state, context, arguments.from)?;
+            let (to_parent, to_name) = decode_directory_operation(state, context, arguments.to)?;
+            let (from, to) = vfs.rename(context, from_parent, &from_name, to_parent, &to_name).await?;
+            nfs_reply(
+                xid,
+                &RenameResult::Ok {
+                    from_directory_wcc: split_wcc(from).1,
+                    to_directory_wcc: split_wcc(to).1,
+                },
+            )?
         },
         NfsArguments::Link(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => return link_failure_reply(xid, status).map(Into::into),
-            };
-            let (parent, name) = match decode_directory_operation(arguments.target, state, context.export_id) {
-                Ok(value) => value,
-                Err(status) => return link_failure_reply(xid, status).map(Into::into),
-            };
-            let result = match vfs.link(context, object, parent, &name).await {
-                Ok(result) => {
-                    let object_attributes = vfs.getattr(context, object).await.ok();
-                    LinkResult::Ok {
-                        object_attributes,
-                        directory_wcc: WccData {
-                            before: result.before,
-                            after: result.after,
-                        },
-                    }
+            let object = decode_object(state, context, &arguments.object)?;
+            let (parent, name) = decode_directory_operation(state, context, arguments.target)?;
+            let ((), directory_wcc) = split_wcc(vfs.link(context, object, parent, &name).await?);
+            let object_attributes = vfs.getattr(context, object).await.ok();
+            nfs_reply(
+                xid,
+                &LinkResult::Ok {
+                    object_attributes,
+                    directory_wcc,
                 },
-                Err(error) => LinkResult::Err {
-                    status: error.into(),
-                    object_attributes: None,
-                    directory_wcc: WccData::default(),
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            )?
         },
         NfsArguments::ReadDir(arguments) => {
-            let directory = match decode_object(&arguments.directory, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &ReadDirResult::Err {
-                            status: wire_nfs_status(status)?,
-                            directory_attributes: None,
-                        },
-                    )?
-                    .into())
-                },
+            let directory = decode_object(state, context, &arguments.directory)?;
+            let request = ReadDirRequest {
+                directory,
+                cookie: arguments.cookie,
+                verifier: arguments.verifier,
+                max_count: arguments.count,
+                directory_count: None,
             };
-            let cookie = arguments.cookie;
-            let verifier = arguments.verifier;
-            let max_count = arguments.count;
-            let wire_limit = max_count.min(state.limits.max_readdir_response_size) as usize;
-            if wire_limit < 20 {
-                return Ok(typed_nfs_reply(
-                    xid,
-                    &ReadDirResult::Err {
-                        status: NfsStatus::TooSmall,
-                        directory_attributes: None,
-                    },
-                )?
-                .into());
-            }
-            let directory_limit: Option<usize> = None;
-            let hint_limit = directory_limit.map_or(wire_limit, |limit| limit.min(wire_limit));
-            let hint = (hint_limit / 32).clamp(1, 4096);
-            match vfs.readdir(context, directory, cookie, verifier, hint).await {
-                Ok(page) => {
-                    let attributes = vfs.getattr(context, directory).await.ok();
-                    readdir_reply(
-                        xid,
-                        state,
-                        context.export_id,
-                        false,
-                        attributes.as_ref(),
-                        page,
-                        (directory_limit, wire_limit),
-                    )?
-                },
-                Err(error) => typed_nfs_reply(
-                    xid,
-                    &ReadDirResult::Err {
-                        status: error.into(),
-                        directory_attributes: None,
-                    },
-                )?,
-            }
+            readdir_reply(xid, request, context, state, vfs).await?
         },
         NfsArguments::ReadDirPlus(arguments) => {
-            let directory = match decode_object(&arguments.directory, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &ReadDirResult::Err {
-                            status: wire_nfs_status(status)?,
-                            directory_attributes: None,
-                        },
-                    )?
-                    .into())
-                },
+            let directory = decode_object(state, context, &arguments.directory)?;
+            let request = ReadDirRequest {
+                directory,
+                cookie: arguments.cookie,
+                verifier: arguments.verifier,
+                max_count: arguments.max_count,
+                directory_count: Some(arguments.directory_count),
             };
-            let wire_limit = arguments.max_count.min(state.limits.max_readdir_response_size) as usize;
-            if wire_limit < 20 {
-                return Ok(typed_nfs_reply(
-                    xid,
-                    &ReadDirResult::Err {
-                        status: NfsStatus::TooSmall,
-                        directory_attributes: None,
-                    },
-                )?
-                .into());
-            }
-            let directory_limit = Some(arguments.directory_count as usize);
-            let hint_limit = directory_limit.map_or(wire_limit, |limit| limit.min(wire_limit));
-            let hint = (hint_limit / 32).clamp(1, 4096);
-            match vfs
-                .readdir(context, directory, arguments.cookie, arguments.verifier, hint)
-                .await
-            {
-                Ok(page) => {
-                    let attributes = vfs.getattr(context, directory).await.ok();
-                    readdir_reply(
-                        xid,
-                        state,
-                        context.export_id,
-                        true,
-                        attributes.as_ref(),
-                        page,
-                        (directory_limit, wire_limit),
-                    )?
-                },
-                Err(error) => typed_nfs_reply(
-                    xid,
-                    &ReadDirResult::Err {
-                        status: error.into(),
-                        directory_attributes: None,
-                    },
-                )?,
-            }
+            readdir_reply(xid, request, context, state, vfs).await?
         },
         NfsArguments::FsStat(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &FsStatResult::Err {
-                            status: wire_nfs_status(status)?,
-                            attributes: None,
-                        },
-                    )?
-                    .into())
-                },
-            };
-            let result = match vfs.fsstat(context, object).await {
-                Ok(info) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    FsStatResult::Ok { attributes, info }
-                },
-                Err(error) => FsStatResult::Err {
-                    status: error.into(),
-                    attributes: None,
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            let object = decode_object(state, context, &arguments.object)?;
+            let info = vfs.fsstat(context, object).await?;
+            let attributes = vfs.getattr(context, object).await.ok();
+            nfs_reply(xid, &FsStatResult::Ok { attributes, info })?
         },
         NfsArguments::FsInfo(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &FsInfoResult::Err {
-                            status: wire_nfs_status(status)?,
-                            attributes: None,
-                        },
-                    )?
-                    .into())
-                },
+            let object = decode_object(state, context, &arguments.object)?;
+            let info = vfs.fsinfo(context, object).await?;
+            let attributes = vfs.getattr(context, object).await.ok();
+            let capabilities = vfs.capabilities();
+            let properties = [
+                (capabilities.hard_links, FSF3_LINK),
+                (capabilities.symbolic_links, FSF3_SYMLINK),
+                (capabilities.homogeneous, FSF3_HOMOGENEOUS),
+                (capabilities.can_set_time, FSF3_CANSETTIME),
+            ]
+            .into_iter()
+            .filter(|(supported, _)| *supported)
+            .fold(0, |properties, (_, bit)| properties | bit);
+            // Transfer sizes are clamped to what the transport can carry.
+            let max_read = info.max_read.min(state.limits.max_read_size);
+            let max_write = info.max_write.min(state.limits.max_write_size);
+            let info = FsInfo {
+                max_read,
+                preferred_read: info.preferred_read.min(max_read),
+                read_multiple: info.read_multiple.min(max_read),
+                max_write,
+                preferred_write: info.preferred_write.min(max_write),
+                write_multiple: info.write_multiple.min(max_write),
+                preferred_readdir: info.preferred_readdir.min(state.limits.max_readdir_response_size),
+                ..info
             };
-            match vfs.fsinfo(context, object).await {
-                Ok(info) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    let capabilities = vfs.capabilities();
-                    let max_read = info.max_read.min(state.limits.max_read_size);
-                    let max_write = info.max_write.min(state.limits.max_write_size);
-                    let properties = u32::from(capabilities.hard_links)
-                        | (u32::from(capabilities.symbolic_links) << 1)
-                        | (u32::from(capabilities.homogeneous) << 3)
-                        | (u32::from(capabilities.can_set_time) << 4);
-                    typed_nfs_reply(
-                        xid,
-                        &FsInfoResult::Ok {
-                            attributes,
-                            info: crate::vfs::FsInfo {
-                                max_read,
-                                preferred_read: info.preferred_read.min(max_read),
-                                read_multiple: info.read_multiple.min(max_read),
-                                max_write,
-                                preferred_write: info.preferred_write.min(max_write),
-                                write_multiple: info.write_multiple.min(max_write),
-                                preferred_readdir: info.preferred_readdir.min(state.limits.max_readdir_response_size),
-                                ..info
-                            },
-                            properties,
-                        },
-                    )?
+            nfs_reply(
+                xid,
+                &FsInfoResult::Ok {
+                    attributes,
+                    info,
+                    properties,
                 },
-                Err(error) => typed_nfs_reply(
-                    xid,
-                    &FsInfoResult::Err {
-                        status: error.into(),
-                        attributes: None,
-                    },
-                )?,
-            }
+            )?
         },
         NfsArguments::PathConf(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &PathConfResult::Err {
-                            status: wire_nfs_status(status)?,
-                            attributes: None,
-                        },
-                    )?
-                    .into())
-                },
-            };
-            let result = match vfs.pathconf(context, object).await {
-                Ok(mut info) => {
-                    let attributes = vfs.getattr(context, object).await.ok();
-                    info.max_name_length = info.max_name_length.min(NfsName::MAX_LEN as u32);
-                    PathConfResult::Ok { attributes, info }
-                },
-                Err(error) => PathConfResult::Err {
-                    status: error.into(),
-                    attributes: None,
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            let object = decode_object(state, context, &arguments.object)?;
+            let mut info = vfs.pathconf(context, object).await?;
+            let attributes = vfs.getattr(context, object).await.ok();
+            info.max_name_length = info.max_name_length.min(NfsName::MAX_LEN as u32);
+            nfs_reply(xid, &PathConfResult::Ok { attributes, info })?
         },
         NfsArguments::Commit(arguments) => {
-            let object = match decode_object(&arguments.object, state, context.export_id) {
-                Ok(object) => object,
-                Err(status) => {
-                    return Ok(typed_nfs_reply(
-                        xid,
-                        &CommitResult::Err {
-                            status: wire_nfs_status(status)?,
-                            file_wcc: WccData::default(),
-                        },
-                    )?
-                    .into())
-                },
-            };
-            let result = match vfs.commit(context, object, arguments.offset, arguments.count).await {
-                Ok(result) => CommitResult::Ok {
-                    file_wcc: WccData {
-                        before: result.before,
-                        after: result.after,
-                    },
+            let object = decode_object(state, context, &arguments.object)?;
+            let result = vfs.commit(context, object, arguments.offset, arguments.count).await?;
+            let ((), file_wcc) = split_wcc(result);
+            nfs_reply(
+                xid,
+                &CommitResult::Ok {
+                    file_wcc,
                     verifier: state.handles.instance_id(),
                 },
-                Err(error) => CommitResult::Err {
-                    status: error.into(),
-                    file_wcc: WccData::default(),
-                },
-            };
-            typed_nfs_reply(xid, &result)?
+            )?
         },
-        NfsArguments::Null => accepted_reply(xid, SUCCESS, &[]),
     };
     Ok(reply.into())
 }
 
 async fn dispatch_read(
     xid: u32,
-    arguments: crate::nfs3::procedures::ReadArgs,
+    arguments: ReadArgs,
     context: &RequestContext,
     state: &ConnectionState,
     vfs: &dyn VirtualFileSystem,
-) -> Result<EncodedReply, ServerError> {
-    let object = match decode_object(&arguments.object, state, context.export_id) {
-        Ok(object) => object,
-        Err(status) => {
-            return Ok(typed_nfs_reply(
-                xid,
-                &ReadResult::Err {
-                    status: wire_nfs_status(status)?,
-                    attributes: None,
-                },
-            )?
-            .into())
-        },
-    };
-    let count = arguments.count.min(state.limits.max_read_size) as usize;
-    match vfs.read_bytes(context, object, arguments.offset, count as u32).await {
-        Ok(result) => {
-            // `Bytes::slice` retains the backend allocation without copying;
-            // the segmented reply keeps it alive through replay and socket I/O.
-            let data = if result.data.len() > count {
-                result.data.slice(..count)
-            } else {
-                result.data
-            };
-            read_success_reply(xid, result.attributes.as_ref(), data, result.eof).map_err(Into::into)
-        },
-        Err(error) => Ok(typed_nfs_reply(
-            xid,
-            &ReadResult::Err {
-                status: error.into(),
-                attributes: None,
-            },
-        )?
-        .into()),
-    }
+) -> Result<EncodedReply, NfsFailure> {
+    let object = decode_object(state, context, &arguments.object)?;
+    let count = arguments.count.min(state.limits.max_read_size);
+    let mut result = vfs.read_bytes(context, object, arguments.offset, count).await?;
+    // `Bytes::truncate` keeps sharing the backend allocation; the segmented
+    // reply holds it through socket I/O without copying the payload.
+    result.data.truncate(count as usize);
+    Ok(read_success_reply(xid, result.attributes.as_ref(), result.data, result.eof)?)
 }
 
 fn read_success_reply(
@@ -1210,7 +942,7 @@ fn read_success_reply(
     // Encode only the fixed RPC/NFS fields here. The potentially large opaque
     // payload and its static zero padding remain separate transport segments.
     let data_length = u32::try_from(data.len()).map_err(|_| EncodeError::TooLarge(data.len()))?;
-    let mut prefix = accepted_reply_encoder(xid, SUCCESS, 128);
+    let mut prefix = message::accepted_reply_encoder(xid, AcceptStatus::Success, 128);
     prefix.write_u32(NfsStatus::Ok as u32);
     encode_post_attributes(&mut prefix, attributes)?;
     prefix.write_u32(data_length);
@@ -1226,377 +958,262 @@ async fn dispatch_write(
     context: &RequestContext,
     state: &ConnectionState,
     vfs: &dyn VirtualFileSystem,
-) -> Result<Vec<u8>, ServerError> {
-    if let Err(status) = arguments.validate() {
-        return Ok(typed_nfs_reply(
-            xid,
-            &WriteResult::Err {
-                status,
-                file_wcc: WccData::default(),
-            },
-        )?);
-    }
-    let object = match decode_object(&arguments.object, state, context.export_id) {
-        Ok(object) => object,
-        Err(status) => {
-            return Ok(typed_nfs_reply(
-                xid,
-                &WriteResult::Err {
-                    status: wire_nfs_status(status)?,
-                    file_wcc: WccData::default(),
-                },
-            )?)
-        },
-    };
+) -> Result<EncodedReply, NfsFailure> {
+    arguments.validate()?;
+    let object = decode_object(state, context, &arguments.object)?;
     let requested = arguments.requested;
     let permitted_count = arguments.data.len().min(state.limits.max_write_size as usize);
     // `WriteRequest` owns the RPC record, so this borrowed range stays valid
     // for the complete asynchronous backend call without another allocation.
     let data = &arguments.data[..permitted_count];
-    let result = match vfs.write(context, object, arguments.offset, data, requested).await {
-        Ok(result)
-            if result.value.count as usize <= data.len()
-                && (data.is_empty() || result.value.count != 0)
-                && durability_satisfies(result.value.committed, requested) =>
-        {
-            WriteResult::Ok {
-                file_wcc: WccData {
-                    before: result.before,
-                    after: result.after,
-                },
-                count: result.value.count,
-                committed: result.value.committed,
-                verifier: state.handles.instance_id(),
-            }
-        },
-        Ok(result) => WriteResult::Err {
+    let (written, file_wcc) = split_wcc(vfs.write(context, object, arguments.offset, data, requested).await?);
+    // Never report more bytes than were offered, no progress for a non-empty
+    // write, or weaker durability than the client requested.
+    let result = if written.count as usize <= data.len()
+        && (data.is_empty() || written.count != 0)
+        && durability_satisfies(written.committed, requested)
+    {
+        WriteResult::Ok {
+            file_wcc,
+            count: written.count,
+            committed: written.committed,
+            verifier: state.handles.instance_id(),
+        }
+    } else {
+        WriteResult::Err {
             status: NfsStatus::ServerFault,
-            file_wcc: WccData {
-                before: result.before,
-                after: result.after,
-            },
-        },
-        Err(error) => WriteResult::Err {
-            status: error.into(),
-            file_wcc: WccData::default(),
-        },
+            file_wcc,
+        }
     };
-    Ok(typed_nfs_reply(xid, &result)?)
+    Ok(nfs_reply(xid, &result)?.into())
 }
 
-fn durability_satisfies(actual: crate::vfs::WriteStability, requested: crate::vfs::WriteStability) -> bool {
-    use crate::vfs::WriteStability::{DataSync, FileSync, Unstable};
+fn durability_satisfies(actual: WriteStability, requested: WriteStability) -> bool {
+    use WriteStability::{DataSync, FileSync, Unstable};
     matches!((actual, requested), (FileSync, _) | (DataSync, DataSync | Unstable) | (Unstable, Unstable))
 }
 
-fn decode_object(handle: &[u8], state: &ConnectionState, export_id: ExportId) -> Result<ObjectKey, u32> {
-    state.handles.decode(export_id, handle).map_err(|error| match error {
-        crate::handles::HandleError::StaleInstance => 70,
-        _ => 10001,
+struct ReadDirRequest {
+    directory: ObjectKey,
+    cookie: u64,
+    verifier: [u8; 8],
+    max_count: u32,
+    /// READDIRPLUS `dircount`; `None` for READDIR.
+    directory_count: Option<u32>,
+}
+
+async fn readdir_reply(
+    xid: u32,
+    request: ReadDirRequest,
+    context: &RequestContext,
+    state: &ConnectionState,
+    vfs: &dyn VirtualFileSystem,
+) -> Result<Vec<u8>, NfsFailure> {
+    let max_size = request.max_count.min(state.limits.max_readdir_response_size) as usize;
+    if max_size < MINIMUM_READDIR_COUNT {
+        return Err(NfsStatus::TooSmall.into());
+    }
+    let limits = ReadDirLimits {
+        max_size,
+        directory_size: request.directory_count.map(|count| count as usize),
+    };
+    // Directory entries need at least 32 bytes on the wire; the hint keeps
+    // backend pages close to what one reply can carry.
+    let hint = (limits.directory_size.map_or(max_size, |count| count.min(max_size)) / 32).clamp(1, 4096);
+    let page = vfs
+        .readdir(context, request.directory, request.cookie, request.verifier, hint)
+        .await?;
+    let directory_attributes = vfs.getattr(context, request.directory).await.ok();
+    let plus = request.directory_count.is_some();
+    // Entries are converted lazily, so file handles are only authenticated
+    // for entries that fit in the reply.
+    let entries = page.entries.into_iter().map(|entry| ReadDirEntry {
+        file_id: entry.file_id,
+        name: entry.name.into_bytes(),
+        cookie: entry.cookie,
+        extension: if plus {
+            ReadDirEntryExtension::Plus {
+                attributes: entry.attributes,
+                handle: Some(encode_handle(state, context, entry.object)),
+            }
+        } else {
+            ReadDirEntryExtension::Basic
+        },
+    });
+    let mut reply = message::accepted_reply_encoder(xid, AcceptStatus::Success, max_size.min(64 * 1024) + 4);
+    encode_readdir_reply(&mut reply, directory_attributes.as_ref(), page.verifier, entries, page.eof, limits)?;
+    Ok(reply.into_bytes())
+}
+
+fn decode_object(state: &ConnectionState, context: &RequestContext, handle: &[u8]) -> Result<ObjectKey, NfsStatus> {
+    state.handles.decode(context.export_id, handle).map_err(|error| match error {
+        HandleError::StaleInstance => NfsStatus::Stale,
+        _ => NfsStatus::BadHandle,
     })
 }
 
 fn decode_directory_operation(
-    arguments: DirectoryOperationArgs,
     state: &ConnectionState,
-    export_id: ExportId,
-) -> Result<(ObjectKey, NfsName), u32> {
-    let parent = decode_object(&arguments.directory, state, export_id)?;
-    if arguments.name.len() > NfsName::MAX_LEN {
-        return Err(NfsStatus::NameTooLong as u32);
-    }
-    let name = NfsName::new(arguments.name).map_err(nfs_status)?;
+    context: &RequestContext,
+    arguments: DirectoryOperationArgs,
+) -> Result<(ObjectKey, NfsName), NfsStatus> {
+    let parent = decode_object(state, context, &arguments.directory)?;
+    let name = NfsName::new(arguments.name)?;
     Ok((parent, name))
 }
 
-fn wire_nfs_status(status: u32) -> Result<NfsStatus, DecodeError> {
-    Ok(NfsStatus::from_code(status).unwrap_or(NfsStatus::ServerFault))
+fn encode_handle(state: &ConnectionState, context: &RequestContext, object: ObjectKey) -> Vec<u8> {
+    state.handles.encode(context.export_id, object).to_vec()
 }
 
-fn nfs_failure_reply_for_procedure(xid: u32, procedure: u32, status: NfsStatus) -> Result<Vec<u8>, EncodeError> {
-    let wcc = WccData::default();
+fn split_wcc<T>(result: MutationResult<T>) -> (T, WccData) {
+    (
+        result.value,
+        WccData {
+            before: result.before,
+            after: result.after,
+        },
+    )
+}
+
+fn create_reply(
+    xid: u32,
+    state: &ConnectionState,
+    context: &RequestContext,
+    created: MutationResult<CreatedObject>,
+) -> Result<Vec<u8>, EncodeError> {
+    let (created, directory_wcc) = split_wcc(created);
+    nfs_reply(
+        xid,
+        &CreateResult::Ok {
+            object_handle: Some(encode_handle(state, context, created.object)),
+            object_attributes: created.attributes,
+            directory_wcc,
+        },
+    )
+}
+
+fn nfs_reply<T: EncodeNfsResult>(xid: u32, result: &T) -> Result<Vec<u8>, EncodeError> {
+    let mut reply = message::accepted_reply_encoder(xid, AcceptStatus::Success, 128);
+    result.encode_result(&mut reply)?;
+    Ok(reply.into_bytes())
+}
+
+/// Encodes the failure arm of `procedure` with no post-operation attributes
+/// or WCC data.
+fn nfs_failure_reply(xid: u32, procedure: Procedure, status: NfsStatus) -> Result<Vec<u8>, EncodeError> {
+    let wcc = WccData::default;
     match procedure {
-        1 => typed_nfs_reply(xid, &GetAttrResult::Err { status }),
-        2 => typed_nfs_reply(
+        Procedure::Null => Ok(message::accepted_reply(xid, AcceptStatus::ProcedureUnavailable, &[])),
+        Procedure::GetAttr => nfs_reply(xid, &GetAttrResult::Err { status }),
+        Procedure::SetAttr => nfs_reply(
             xid,
             &SetAttrResult::Err {
                 status,
-                object_wcc: wcc,
+                object_wcc: wcc(),
             },
         ),
-        3 => typed_nfs_reply(
+        Procedure::Lookup => nfs_reply(
             xid,
             &LookupResult::Err {
                 status,
                 directory_attributes: None,
             },
         ),
-        4 => typed_nfs_reply(
+        Procedure::Access => nfs_reply(
             xid,
             &AccessResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        5 => typed_nfs_reply(
+        Procedure::ReadLink => nfs_reply(
             xid,
             &ReadLinkResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        6 => typed_nfs_reply(
+        Procedure::Read => nfs_reply(
             xid,
             &ReadResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        7 => typed_nfs_reply(xid, &WriteResult::Err { status, file_wcc: wcc }),
-        8..=11 => typed_nfs_reply(
+        Procedure::Write => nfs_reply(
+            xid,
+            &WriteResult::Err {
+                status,
+                file_wcc: wcc(),
+            },
+        ),
+        Procedure::Create | Procedure::Mkdir | Procedure::Symlink | Procedure::Mknod => nfs_reply(
             xid,
             &CreateResult::Err {
                 status,
-                directory_wcc: wcc,
+                directory_wcc: wcc(),
             },
         ),
-        12 | 13 => typed_nfs_reply(
+        Procedure::Remove | Procedure::Rmdir => nfs_reply(
             xid,
             &WccResult::Err {
                 status,
-                object_wcc: wcc,
+                object_wcc: wcc(),
             },
         ),
-        14 => typed_nfs_reply(
+        Procedure::Rename => nfs_reply(
             xid,
             &RenameResult::Err {
                 status,
-                from_directory_wcc: WccData::default(),
-                to_directory_wcc: WccData::default(),
+                from_directory_wcc: wcc(),
+                to_directory_wcc: wcc(),
             },
         ),
-        15 => typed_nfs_reply(
+        Procedure::Link => nfs_reply(
             xid,
             &LinkResult::Err {
                 status,
                 object_attributes: None,
-                directory_wcc: wcc,
+                directory_wcc: wcc(),
             },
         ),
-        16 | 17 => typed_nfs_reply(
+        Procedure::ReadDir | Procedure::ReadDirPlus => nfs_reply(
             xid,
             &ReadDirResult::Err {
                 status,
                 directory_attributes: None,
             },
         ),
-        18 => typed_nfs_reply(
+        Procedure::FsStat => nfs_reply(
             xid,
             &FsStatResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        19 => typed_nfs_reply(
+        Procedure::FsInfo => nfs_reply(
             xid,
             &FsInfoResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        20 => typed_nfs_reply(
+        Procedure::PathConf => nfs_reply(
             xid,
             &PathConfResult::Err {
                 status,
                 attributes: None,
             },
         ),
-        21 => typed_nfs_reply(xid, &CommitResult::Err { status, file_wcc: wcc }),
-        _ => Ok(accepted_reply(xid, PROC_UNAVAIL, &[])),
-    }
-}
-
-fn typed_nfs_reply<T: EncodeNfsResult>(xid: u32, result: &T) -> Result<Vec<u8>, EncodeError> {
-    let mut reply = accepted_reply_encoder(xid, SUCCESS, 128);
-    result.encode_result(&mut reply)?;
-    Ok(reply.into_bytes())
-}
-
-fn mutation_void_reply(xid: u32, result: Result<MutationResult<()>, NfsError>) -> Result<Vec<u8>, EncodeError> {
-    let result = match result {
-        Ok(result) => WccResult::Ok {
-            object_wcc: WccData {
-                before: result.before,
-                after: result.after,
-            },
-        },
-        Err(error) => WccResult::Err {
-            status: error.into(),
-            object_wcc: WccData::default(),
-        },
-    };
-    typed_nfs_reply(xid, &result)
-}
-
-fn create_failure_reply(xid: u32, status: u32) -> Result<Vec<u8>, ServerError> {
-    Ok(typed_nfs_reply(
-        xid,
-        &CreateResult::Err {
-            status: wire_nfs_status(status)?,
-            directory_wcc: WccData::default(),
-        },
-    )?)
-}
-
-fn create_reply(
-    xid: u32,
-    state: &ConnectionState,
-    export_id: ExportId,
-    result: Result<MutationResult<crate::vfs::CreatedObject>, NfsError>,
-) -> Result<Vec<u8>, EncodeError> {
-    let result = match result {
-        Ok(result) => CreateResult::Ok {
-            object_handle: Some(state.handles.encode(export_id, result.value.object).to_vec()),
-            object_attributes: result.value.attributes,
-            directory_wcc: WccData {
-                before: result.before,
-                after: result.after,
-            },
-        },
-        Err(error) => CreateResult::Err {
-            status: error.into(),
-            directory_wcc: WccData::default(),
-        },
-    };
-    typed_nfs_reply(xid, &result)
-}
-
-fn rename_failure_reply(xid: u32, status: u32) -> Result<Vec<u8>, ServerError> {
-    Ok(typed_nfs_reply(
-        xid,
-        &RenameResult::Err {
-            status: wire_nfs_status(status)?,
-            from_directory_wcc: WccData::default(),
-            to_directory_wcc: WccData::default(),
-        },
-    )?)
-}
-
-fn link_failure_reply(xid: u32, status: u32) -> Result<Vec<u8>, ServerError> {
-    Ok(typed_nfs_reply(
-        xid,
-        &LinkResult::Err {
-            status: wire_nfs_status(status)?,
-            object_attributes: None,
-            directory_wcc: WccData::default(),
-        },
-    )?)
-}
-
-fn readdir_reply(
-    xid: u32,
-    state: &ConnectionState,
-    export_id: ExportId,
-    plus: bool,
-    directory_attributes: Option<&FileAttributes>,
-    page: crate::vfs::ReadDirectoryPage,
-    limits: (Option<usize>, usize),
-) -> Result<Vec<u8>, EncodeError> {
-    let (directory_limit, wire_limit) = limits;
-    let mut selected_attributes = directory_attributes.cloned();
-    let mut empty_result = ReadDirResult::Ok {
-        directory_attributes: directory_attributes.cloned(),
-        verifier: page.verifier,
-        entries: Vec::new(),
-        eof: false,
-    };
-    let mut empty = Encoder::new();
-    empty_result.encode_result(&mut empty)?;
-    if empty.len().saturating_sub(4) > wire_limit {
-        selected_attributes = None;
-        empty_result = ReadDirResult::Ok {
-            directory_attributes: None,
-            verifier: page.verifier,
-            entries: Vec::new(),
-            eof: false,
-        };
-        empty = Encoder::new();
-        empty_result.encode_result(&mut empty)?;
-    }
-    if empty.len().saturating_sub(4) > wire_limit {
-        return typed_nfs_reply(
+        Procedure::Commit => nfs_reply(
             xid,
-            &ReadDirResult::Err {
-                status: NfsStatus::TooSmall,
-                directory_attributes: directory_attributes.cloned(),
+            &CommitResult::Err {
+                status,
+                file_wcc: wcc(),
             },
-        );
+        ),
     }
-    let had_entries = !page.entries.is_empty();
-    // Preallocate only a conservative number of entries; the client-controlled
-    // wire limit must not trigger an oversized speculative allocation.
-    let mut entries = Vec::with_capacity(page.entries.len().min(wire_limit / 32));
-    let mut encoded_entries = 0usize;
-    let mut directory_bytes = 0usize;
-    let mut truncated = false;
-    for entry in page.entries {
-        let basic = ReadDirEntry {
-            file_id: entry.file_id,
-            name: entry.name.into_bytes(),
-            cookie: entry.cookie,
-            extension: ReadDirEntryExtension::Basic,
-        };
-        let mut directory_part = Encoder::new();
-        encode_readdir_entry(&mut directory_part, &basic)?;
-        if directory_limit
-            .is_some_and(|limit| directory_bytes.saturating_add(directory_part.len()).saturating_add(4) > limit)
-        {
-            truncated = true;
-            break;
-        }
-        directory_bytes = directory_bytes.saturating_add(directory_part.len());
-        let typed_entry = if plus {
-            ReadDirEntry {
-                extension: ReadDirEntryExtension::Plus {
-                    attributes: entry.attributes,
-                    handle: Some(state.handles.encode(export_id, entry.object).to_vec()),
-                },
-                ..basic
-            }
-        } else {
-            basic
-        };
-        let mut encoded = Encoder::new();
-        encode_readdir_entry(&mut encoded, &typed_entry)?;
-        if empty
-            .len()
-            .saturating_sub(4)
-            .saturating_add(encoded_entries)
-            .saturating_add(encoded.len())
-            > wire_limit
-        {
-            truncated = true;
-            break;
-        }
-        encoded_entries = encoded_entries.saturating_add(encoded.len());
-        entries.push(typed_entry);
-    }
-    if had_entries && truncated && entries.is_empty() {
-        return typed_nfs_reply(
-            xid,
-            &ReadDirResult::Err {
-                status: NfsStatus::TooSmall,
-                directory_attributes: directory_attributes.cloned(),
-            },
-        );
-    }
-    let result = ReadDirResult::Ok {
-        directory_attributes: selected_attributes,
-        verifier: page.verifier,
-        entries,
-        eof: page.eof && !truncated,
-    };
-    typed_nfs_reply(xid, &result)
 }
 
 async fn dispatch_mount(
@@ -1607,69 +1224,67 @@ async fn dispatch_mount(
     state: &ConnectionState,
 ) -> Result<Vec<u8>, ServerError> {
     if matches!(procedure, 0 | 2 | 4 | 5) && !args.is_empty() {
-        return Ok(accepted_reply(xid, GARBAGE_ARGS, &[]));
+        return Ok(message::accepted_reply(xid, AcceptStatus::GarbageArguments, &[]));
     }
     match procedure {
-        0 => Ok(accepted_reply(xid, SUCCESS, &[])),
+        0 => Ok(message::accepted_reply(xid, AcceptStatus::Success, &[])),
         1 => {
             let mut decoder = Decoder::new(args);
-            let path = decoder.read_string("MOUNT path", 1024)?;
+            let path = decoder.read_string("MOUNT path", MAX_PATH)?;
             decoder.finish()?;
             let Some(export) = select_export(state, &path) else {
-                return Ok(typed_mount_reply(xid, &MountResult::Err(MountStatus::NotFound))?);
+                return Ok(mount_reply(xid, &MountResult::Err(MountStatus::NotFound))?);
             };
             let request_context = RequestContext {
                 principal: context.principal.clone(),
                 client_addr: context.client_addr,
                 export_id: export.id,
             };
-            let vfs = &export.vfs;
             let root = match resolve_mount_object(export, &request_context, &path).await {
                 Ok(object) => object,
-                Err(error) => return Ok(typed_mount_reply(xid, &MountResult::Err(mount_status(error)))?),
+                Err(error) => return Ok(mount_reply(xid, &MountResult::Err(mount_status(error)))?),
             };
-            let attributes = match vfs.getattr(&request_context, root).await {
+            let attributes = match export.vfs.getattr(&request_context, root).await {
                 Ok(attributes) => attributes,
-                Err(error) => return Ok(typed_mount_reply(xid, &MountResult::Err(mount_status(error)))?),
+                Err(error) => return Ok(mount_reply(xid, &MountResult::Err(mount_status(error)))?),
             };
             if attributes.file_type != FileType::Directory {
-                return Ok(typed_mount_reply(xid, &MountResult::Err(MountStatus::NotDirectory))?);
+                return Ok(mount_reply(xid, &MountResult::Err(MountStatus::NotDirectory))?);
             }
             let mut mounts = state.mounts.lock().await;
-            let already_mounted = mounts
-                .iter()
-                .any(|entry| entry.0 == context.client_addr.ip() && entry.1 == path);
-            if !already_mounted && mounts.len() >= state.limits.max_mounts {
-                return Ok(typed_mount_reply(xid, &MountResult::Err(MountStatus::Io))?);
-            }
-            if !already_mounted {
-                mounts.push((context.client_addr.ip(), path));
+            let client = context.client_addr.ip();
+            if !mounts.iter().any(|entry| entry.0 == client && entry.1 == path) {
+                if mounts.len() >= state.limits.max_mounts {
+                    return Ok(mount_reply(xid, &MountResult::Err(MountStatus::Io))?);
+                }
+                mounts.push((client, path));
             }
             drop(mounts);
             let auth_flavors = match state.auth_policy {
                 AuthPolicy::Anonymous => vec![AUTH_NONE],
-                AuthPolicy::AuthSys => vec![crate::rpc::auth::AUTH_SYS],
-                AuthPolicy::AuthSysOrAnonymous => vec![crate::rpc::auth::AUTH_SYS, AUTH_NONE],
+                AuthPolicy::AuthSys => vec![AUTH_SYS],
+                AuthPolicy::AuthSysOrAnonymous => vec![AUTH_SYS, AUTH_NONE],
             };
-            typed_mount_reply(
-                xid,
-                &MountResult::Ok {
-                    file_handle: state.handles.encode(export.id, root).to_vec(),
-                    auth_flavors,
-                },
-            )
-            .map_err(ServerError::from)
+            let result = MountResult::Ok {
+                file_handle: state.handles.encode(export.id, root).to_vec(),
+                auth_flavors,
+            };
+            Ok(mount_reply(xid, &result)?)
         },
         2 => {
             let mounts = state.mounts.lock().await;
-            let encoded_length = mounts.iter().try_fold(24usize + 4, |length, (client, path)| {
-                length
-                    .checked_add(4)
-                    .and_then(|length| length.checked_add(xdr_opaque_size(client.to_string().len())?))
-                    .and_then(|length| length.checked_add(xdr_opaque_size(path.len())?))
-            });
+            // Size the list before building it so that an oversized table
+            // never materializes a reply that cannot be sent.
+            let encoded_length = mounts
+                .iter()
+                .try_fold(ACCEPTED_REPLY_HEADER_SIZE + 4, |length, (client, path)| {
+                    length
+                        .checked_add(4)?
+                        .checked_add(xdr_opaque_size(client.to_string().len())?)?
+                        .checked_add(xdr_opaque_size(path.len())?)
+                });
             if encoded_length.is_none_or(|length| !outbound_length_fits(length, &state.limits)) {
-                return Ok(accepted_reply(xid, SYSTEM_ERR, &[]));
+                return Ok(message::accepted_reply(xid, AcceptStatus::SystemError, &[]));
             }
             let result = DumpResult {
                 mounts: mounts
@@ -1680,33 +1295,31 @@ async fn dispatch_mount(
                     })
                     .collect(),
             };
-            Ok(typed_mount_reply(xid, &result)?)
+            Ok(mount_reply(xid, &result)?)
         },
         3 => {
             let mut decoder = Decoder::new(args);
-            let path = decoder.read_string("MOUNT path", 1024)?;
+            let path = decoder.read_string("MOUNT path", MAX_PATH)?;
             decoder.finish()?;
-            state
-                .mounts
-                .lock()
-                .await
-                .retain(|entry| entry.0 != context.client_addr.ip() || entry.1 != path);
-            Ok(accepted_reply(xid, SUCCESS, &[]))
+            let client = context.client_addr.ip();
+            state.mounts.lock().await.retain(|entry| entry.0 != client || entry.1 != path);
+            Ok(message::accepted_reply(xid, AcceptStatus::Success, &[]))
         },
         4 => {
-            state.mounts.lock().await.retain(|entry| entry.0 != context.client_addr.ip());
-            Ok(accepted_reply(xid, SUCCESS, &[]))
+            let client = context.client_addr.ip();
+            state.mounts.lock().await.retain(|entry| entry.0 != client);
+            Ok(message::accepted_reply(xid, AcceptStatus::Success, &[]))
         },
         5 => {
-            let encoded_length = state.exports.iter().try_fold(24usize + 4, |length, export| {
+            let encoded_length = state.exports.iter().try_fold(ACCEPTED_REPLY_HEADER_SIZE + 4, |length, export| {
+                // Each export carries an empty group list terminator.
                 length
+                    .checked_add(4)?
+                    .checked_add(xdr_opaque_size(export.path.len())?)?
                     .checked_add(4)
-                    .and_then(|length| length.checked_add(xdr_opaque_size(export.path.len())?))
-                    // Empty group list terminator.
-                    .and_then(|length| length.checked_add(4))
             });
             if encoded_length.is_none_or(|length| !outbound_length_fits(length, &state.limits)) {
-                return Ok(accepted_reply(xid, SYSTEM_ERR, &[]));
+                return Ok(message::accepted_reply(xid, AcceptStatus::SystemError, &[]));
             }
             let result = ExportResult {
                 exports: state
@@ -1718,78 +1331,30 @@ async fn dispatch_mount(
                     })
                     .collect(),
             };
-            Ok(typed_mount_reply(xid, &result)?)
+            Ok(mount_reply(xid, &result)?)
         },
-        _ => Ok(accepted_reply(xid, PROC_UNAVAIL, &[])),
+        _ => Ok(message::accepted_reply(xid, AcceptStatus::ProcedureUnavailable, &[])),
     }
 }
 
 fn xdr_opaque_size(length: usize) -> Option<usize> {
-    4usize.checked_add(length)?.checked_add((4 - length % 4) % 4)
+    4usize.checked_add(length.checked_next_multiple_of(4)?)
 }
 
 fn outbound_length_fits(length: usize, limits: &ServerLimits) -> bool {
-    length <= limits.max_rpc_record_size
-        && length.div_ceil(limits.max_rpc_fragment_size) <= limits.max_fragments_per_record
+    validate_record_length(length, limits.record_limits()).is_ok()
 }
 
 fn dispatch_portmap(xid: u32, procedure: u32, args: &[u8], state: &ConnectionState) -> Result<Vec<u8>, ServerError> {
     match procedure {
-        0 if args.is_empty() => Ok(accepted_reply(xid, SUCCESS, &[])),
-        0 => Ok(accepted_reply(xid, GARBAGE_ARGS, &[])),
+        0 if args.is_empty() => Ok(message::accepted_reply(xid, AcceptStatus::Success, &[])),
+        0 => Ok(message::accepted_reply(xid, AcceptStatus::GarbageArguments, &[])),
         3 => {
-            let mut decoder = Decoder::new(args);
-            let program = decoder.read_u32()?;
-            let version = decoder.read_u32()?;
-            let transport = decoder.read_u32()?;
-            let _port = decoder.read_u32()?;
-            decoder.finish()?;
-            let port = if transport == crate::portmap::IPPROTO_TCP
-                && ((program == crate::nfs3::types::PROGRAM && version == crate::nfs3::types::VERSION)
-                    || (program == crate::mount3::types::PROGRAM && version == crate::mount3::types::VERSION))
-            {
-                u32::from(state.local_port)
-            } else {
-                0
-            };
-            let mut body = Encoder::new();
-            body.write_u32(port);
-            Ok(accepted_reply(xid, SUCCESS, &body.into_bytes()))
+            let request = crate::portmap::mapping::decode(args)?;
+            let port = crate::portmap::dispatch::get_port(&request, state.local_port, state.local_port);
+            Ok(message::accepted_reply(xid, AcceptStatus::Success, &port.to_be_bytes()))
         },
-        _ => Ok(accepted_reply(xid, PROC_UNAVAIL, &[])),
-    }
-}
-
-fn nfs_status(error: crate::vfs::NfsError) -> u32 {
-    use crate::vfs::NfsError;
-    match error {
-        NfsError::Permission => 1,
-        NfsError::NotFound => 2,
-        NfsError::Io => 5,
-        NfsError::NoDeviceOrAddress => 6,
-        NfsError::Access => 13,
-        NfsError::Exists => 17,
-        NfsError::CrossDevice => 18,
-        NfsError::NoDevice => 19,
-        NfsError::NotDirectory => 20,
-        NfsError::IsDirectory => 21,
-        NfsError::Invalid => 22,
-        NfsError::FileTooLarge => 27,
-        NfsError::NoSpace => 28,
-        NfsError::ReadOnly => 30,
-        NfsError::TooManyLinks => 31,
-        NfsError::NameTooLong => 63,
-        NfsError::NotEmpty => 66,
-        NfsError::Quota => 69,
-        NfsError::Stale => 70,
-        NfsError::Remote => 71,
-        NfsError::NotSynchronized => 10002,
-        NfsError::BadCookie => 10003,
-        NfsError::NotSupported => 10004,
-        NfsError::TooSmall => 10005,
-        NfsError::ServerFault => 10006,
-        NfsError::BadType => 10007,
-        NfsError::Jukebox => 10008,
+        _ => Ok(message::accepted_reply(xid, AcceptStatus::ProcedureUnavailable, &[])),
     }
 }
 
@@ -1800,10 +1365,6 @@ fn principal_allowed(policy: AuthPolicy, principal: &Principal) -> bool {
             | (AuthPolicy::Anonymous, Principal::Anonymous)
             | (AuthPolicy::AuthSysOrAnonymous, _)
     )
-}
-
-fn export_matches(export: &str, requested: &[u8]) -> bool {
-    crate::mount3::dispatch::export_matches(export.as_bytes(), requested)
 }
 
 async fn resolve_mount_object(
@@ -1843,65 +1404,122 @@ fn mount_status(error: NfsError) -> MountStatus {
     }
 }
 
-fn typed_mount_reply<T: EncodeMountResult>(xid: u32, result: &T) -> Result<Vec<u8>, EncodeError> {
-    let mut reply = accepted_reply_encoder(xid, SUCCESS, 64);
+fn mount_reply<T: EncodeMountResult>(xid: u32, result: &T) -> Result<Vec<u8>, EncodeError> {
+    let mut reply = message::accepted_reply_encoder(xid, AcceptStatus::Success, 64);
     result.encode_result(&mut reply)?;
     Ok(reply.into_bytes())
 }
 
-fn accepted_reply(xid: u32, status: u32, body: &[u8]) -> Vec<u8> {
-    let mut reply = accepted_reply_encoder(xid, status, body.len());
-    reply.write_fixed(body);
-    reply.into_bytes()
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::WccAttributes;
 
-fn accepted_reply_encoder(xid: u32, status: u32, body_capacity: usize) -> Encoder {
-    // Typed result encoders append directly after the accepted-reply header,
-    // avoiding a temporary body buffer and a second copy into the final reply.
-    let mut reply = Encoder::with_capacity(24usize.saturating_add(body_capacity));
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(MSG_ACCEPTED);
-    reply.write_u32(AUTH_NONE);
-    reply.write_u32(0);
-    reply.write_u32(status);
-    reply
-}
+    #[test]
+    fn durability_is_never_weaker_than_requested() {
+        use WriteStability::{DataSync, FileSync, Unstable};
+        for (actual, requested, satisfied) in [
+            (Unstable, Unstable, true),
+            (Unstable, DataSync, false),
+            (Unstable, FileSync, false),
+            (DataSync, Unstable, true),
+            (DataSync, DataSync, true),
+            (DataSync, FileSync, false),
+            (FileSync, Unstable, true),
+            (FileSync, DataSync, true),
+            (FileSync, FileSync, true),
+        ] {
+            assert_eq!(durability_satisfies(actual, requested), satisfied, "{actual:?} for {requested:?}");
+        }
+    }
 
-fn program_mismatch(xid: u32, low: u32, high: u32) -> Vec<u8> {
-    let mut reply = accepted_reply_encoder(xid, PROG_MISMATCH, 8);
-    reply.write_u32(low);
-    reply.write_u32(high);
-    reply.into_bytes()
-}
+    #[test]
+    fn only_non_idempotent_nfs_v3_calls_use_the_replay_cache() {
+        let header = |program, version, procedure| CallHeader {
+            xid: 1,
+            rpc_version: 2,
+            program,
+            version,
+            procedure,
+        };
+        let nfs = crate::nfs3::types::PROGRAM;
+        for procedure in 0..crate::nfs3::types::PROCEDURE_COUNT {
+            let expected = Procedure::from_wire(procedure).unwrap().is_non_idempotent();
+            assert_eq!(requires_replay_protection(header(nfs, 3, procedure)), expected);
+            assert!(!requires_replay_protection(header(nfs, 2, procedure)));
+        }
+        assert!(!requires_replay_protection(header(nfs, 3, 99)));
+        for procedure in 0..6 {
+            assert!(!requires_replay_protection(header(crate::mount3::types::PROGRAM, 3, procedure)));
+        }
+        assert!(!requires_replay_protection(header(crate::portmap::PROGRAM, 2, 3)));
+    }
 
-fn rpc_mismatch(xid: u32, low: u32, high: u32) -> Vec<u8> {
-    let mut reply = Encoder::with_capacity(24);
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(1);
-    reply.write_u32(0);
-    reply.write_u32(low);
-    reply.write_u32(high);
-    reply.into_bytes()
-}
+    #[test]
+    fn every_failure_arm_is_a_complete_result_without_post_operation_data() {
+        for procedure in (1..crate::nfs3::types::PROCEDURE_COUNT).filter_map(Procedure::from_wire) {
+            let reply = nfs_failure_reply(9, procedure, NfsStatus::BadHandle).unwrap();
+            let mut decoder = Decoder::new(&reply[ACCEPTED_REPLY_HEADER_SIZE..]);
+            assert_eq!(decoder.read_u32(), Ok(NfsStatus::BadHandle as u32), "{}", procedure.name());
+            // Every remaining word is an absent post-op attribute or WCC arm.
+            while decoder.remaining() > 0 {
+                assert_eq!(decoder.read_bool(), Ok(false), "{}", procedure.name());
+            }
+            let wcc_arms = match procedure {
+                Procedure::GetAttr => 0,
+                Procedure::SetAttr
+                | Procedure::Write
+                | Procedure::Create
+                | Procedure::Mkdir
+                | Procedure::Symlink
+                | Procedure::Mknod
+                | Procedure::Remove
+                | Procedure::Rmdir
+                | Procedure::Commit => 2,
+                Procedure::Rename => 4,
+                Procedure::Link => 3,
+                _ => 1,
+            };
+            assert_eq!(reply.len(), ACCEPTED_REPLY_HEADER_SIZE + 4 + 4 * wcc_arms, "{}", procedure.name());
+        }
+    }
 
-fn auth_error(xid: u32, status: u32) -> Vec<u8> {
-    let mut reply = Encoder::with_capacity(20);
-    reply.write_u32(xid);
-    reply.write_u32(RPC_REPLY);
-    reply.write_u32(1);
-    reply.write_u32(1);
-    reply.write_u32(status);
-    reply.into_bytes()
-}
+    #[test]
+    fn mutation_wcc_data_is_moved_into_the_wire_result() {
+        let before = WccAttributes {
+            size: 1,
+            modify_time: Default::default(),
+            change_time: Default::default(),
+        };
+        let (value, wcc) = split_wcc(MutationResult {
+            value: 7,
+            before: Some(before),
+            after: None,
+        });
+        assert_eq!(value, 7);
+        assert_eq!(wcc.before, Some(before));
+        assert_eq!(wcc.after, None);
+    }
 
-fn error_reply(xid: Option<u32>, status: u32) -> EncodedReply {
-    accepted_reply(xid.unwrap_or(0), status, &[]).into()
-}
+    #[test]
+    fn xdr_list_sizes_include_padding_and_reject_overflow() {
+        assert_eq!(xdr_opaque_size(0), Some(4));
+        assert_eq!(xdr_opaque_size(1), Some(8));
+        assert_eq!(xdr_opaque_size(4), Some(8));
+        assert_eq!(xdr_opaque_size(usize::MAX), None);
+        let limits = ServerLimits::production_defaults();
+        assert!(outbound_length_fits(limits.max_rpc_record_size, &limits));
+        assert!(!outbound_length_fits(limits.max_rpc_record_size + 1, &limits));
+    }
 
-impl From<DecodeError> for ServerError {
-    fn from(value: DecodeError) -> Self {
-        Self::Decode(value)
+    #[test]
+    fn procedure_names_cover_every_served_program() {
+        assert_eq!(procedure_name(crate::nfs3::types::PROGRAM, 17), "READDIRPLUS");
+        assert_eq!(procedure_name(crate::nfs3::types::PROGRAM, 22), "UNKNOWN_NFS");
+        assert_eq!(procedure_name(crate::mount3::types::PROGRAM, 1), "MNT");
+        assert_eq!(procedure_name(crate::mount3::types::PROGRAM, 6), "UNKNOWN_MOUNT");
+        assert_eq!(procedure_name(crate::portmap::PROGRAM, 3), "GETPORT");
+        assert_eq!(procedure_name(crate::portmap::PROGRAM, 1), "UNKNOWN_PORTMAP");
+        assert_eq!(procedure_name(1, 0), "UNKNOWN_RPC");
     }
 }

@@ -373,51 +373,96 @@ pub fn encode_readdir_entry(encoder: &mut Encoder, entry: &ReadDirEntry) -> Resu
     Ok(())
 }
 
-/// Applies the production READDIR wire-size policy to a complete typed
-/// result. `max_size` applies to the successful result arm, excluding the
-/// status discriminant as required by RFC 1813. Returns `false` when even the
-/// empty success shape cannot fit.
-pub fn truncate_readdir_result(result: &mut ReadDirResult, max_size: usize) -> Result<bool, EncodeError> {
-    // Encode the complete result once, then subtract each removed entry's
-    // independent XDR representation. This preserves the old truncation
-    // policy without repeatedly encoding the entire remaining directory.
-    let mut encoder = Encoder::new();
-    result.encode_result(&mut encoder)?;
-    let mut encoded_size = encoder.len().saturating_sub(4);
-    if encoded_size <= max_size {
-        return Ok(true);
-    }
-    let ReadDirResult::Ok { entries, eof, .. } = result else {
-        return Ok(false);
-    };
-    while encoded_size > max_size {
-        let Some(removed) = entries.pop() else {
-            return Ok(false);
-        };
-        let mut removed_encoder = Encoder::new();
-        encode_readdir_entry(&mut removed_encoder, &removed)?;
-        encoded_size = encoded_size.saturating_sub(removed_encoder.len());
-        *eof = false;
-    }
-    Ok(true)
+/// XDR size of `fattr3`.
+pub const FATTR3_SIZE: usize = 84;
+/// XDR size of a `READDIR3resok` without entries or directory attributes:
+/// the post-op attribute flag, cookie verifier, list terminator, and eof.
+const EMPTY_READDIR_SIZE: usize = 4 + 8 + 4 + 4;
+
+/// Size limits for one READDIR or READDIRPLUS result (RFC 1813).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadDirLimits {
+    /// Maximum size of the `READDIR3resok`/`READDIRPLUS3resok` value,
+    /// excluding the status discriminant (`count` or `maxcount`).
+    pub max_size: usize,
+    /// READDIRPLUS `dircount`: maximum bytes of directory information,
+    /// counting each entry without its attributes and file handle.
+    pub directory_size: Option<usize>,
 }
 
-#[cfg(test)]
-fn truncate_readdir_result_reference(result: &mut ReadDirResult, max_size: usize) -> Result<bool, EncodeError> {
-    loop {
-        let mut encoder = Encoder::new();
-        result.encode_result(&mut encoder)?;
-        if encoder.len().saturating_sub(4) <= max_size {
-            return Ok(true);
-        }
-        match result {
-            ReadDirResult::Ok { entries, eof, .. } if !entries.is_empty() => {
-                entries.pop();
-                *eof = false;
-            },
-            _ => return Ok(false),
-        }
+/// Encodes a complete READDIR or READDIRPLUS result with the production size
+/// policy, pulling entries from `entries` only while they fit:
+///
+/// * directory attributes are omitted when they alone exceed `max_size`;
+/// * entries stop at the first one that would exceed `max_size` or the `dircount` budget, and a truncated listing never
+///   reports `eof`;
+/// * `NFS3ERR_TOOSMALL` is returned when not even an empty listing, or the first available entry, fits.
+pub fn encode_readdir_reply(
+    encoder: &mut Encoder,
+    directory_attributes: Option<&FileAttributes>,
+    verifier: [u8; 8],
+    entries: impl IntoIterator<Item = ReadDirEntry>,
+    eof: bool,
+    limits: ReadDirLimits,
+) -> Result<(), EncodeError> {
+    let start = encoder.len();
+    let attributes = directory_attributes.filter(|_| EMPTY_READDIR_SIZE + FATTR3_SIZE <= limits.max_size);
+    let mut used = EMPTY_READDIR_SIZE + attributes.map_or(0, |_| FATTR3_SIZE);
+    if used > limits.max_size {
+        return encode_readdir_too_small(encoder, directory_attributes);
     }
+    encoder.write_u32(NfsStatus::Ok as u32);
+    encode_post_attributes(encoder, attributes)?;
+    encoder.write_fixed(&verifier);
+    let mut directory_used = 0usize;
+    let mut encoded_any = false;
+    let mut truncated = false;
+    for entry in entries {
+        let (directory_bytes, total_bytes) = readdir_entry_size(&entry);
+        // The list terminator also counts toward `dircount`.
+        let directory_fits = limits
+            .directory_size
+            .is_none_or(|limit| directory_used + directory_bytes + 4 <= limit);
+        if !directory_fits || used + total_bytes > limits.max_size {
+            truncated = true;
+            break;
+        }
+        directory_used += directory_bytes;
+        used += total_bytes;
+        encode_readdir_entry(encoder, &entry)?;
+        encoded_any = true;
+    }
+    if truncated && !encoded_any {
+        encoder.truncate(start);
+        return encode_readdir_too_small(encoder, directory_attributes);
+    }
+    encoder.write_bool(false);
+    encoder.write_bool(eof && !truncated);
+    Ok(())
+}
+
+fn encode_readdir_too_small(encoder: &mut Encoder, attributes: Option<&FileAttributes>) -> Result<(), EncodeError> {
+    encoder.write_u32(NfsStatus::TooSmall as u32);
+    encode_post_attributes(encoder, attributes)
+}
+
+/// Returns the XDR size of one directory entry as `(directory information,
+/// complete entry)`, both including the entry's list discriminant.
+fn readdir_entry_size(entry: &ReadDirEntry) -> (usize, usize) {
+    let directory_bytes = 4 + 8 + xdr_opaque_size(entry.name.len()) + 8;
+    let extension_bytes = match &entry.extension {
+        ReadDirEntryExtension::Basic => 0,
+        ReadDirEntryExtension::Plus { attributes, handle } => {
+            let attributes = attributes.as_ref().map_or(0, |_| FATTR3_SIZE);
+            let handle = handle.as_ref().map_or(0, |handle| xdr_opaque_size(handle.len()));
+            4 + attributes + 4 + handle
+        },
+    };
+    (directory_bytes, directory_bytes + extension_bytes)
+}
+
+fn xdr_opaque_size(length: usize) -> usize {
+    4 + length.next_multiple_of(4)
 }
 
 fn encode_stability(stability: WriteStability) -> u32 {
@@ -603,29 +648,240 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn linear_readdir_truncation_matches_reference_policy() {
-        let template = ReadDirResult::Ok {
-            directory_attributes: None,
-            verifier: [3; 8],
-            entries: (0..32)
-                .map(|index| ReadDirEntry {
-                    file_id: index,
-                    name: vec![b'x'; index as usize % 13 + 1],
-                    cookie: index + 1,
-                    extension: ReadDirEntryExtension::Basic,
-                })
-                .collect(),
-            eof: true,
-        };
-        for limit in (0..=1400).step_by(7) {
-            let mut actual = template.clone();
-            let mut expected = template.clone();
-            assert_eq!(
-                truncate_readdir_result(&mut actual, limit).unwrap(),
-                truncate_readdir_result_reference(&mut expected, limit).unwrap()
-            );
-            assert_eq!(actual, expected);
+    fn readdir_attributes() -> FileAttributes {
+        FileAttributes {
+            file_type: FileType::Directory,
+            mode: 0o755,
+            links: 2,
+            uid: 0,
+            gid: 0,
+            size: 4096,
+            used: 4096,
+            device: None,
+            fs_id: 1,
+            file_id: 1,
+            access_time: NfsTime::default(),
+            modify_time: NfsTime::default(),
+            change_time: NfsTime::default(),
         }
+    }
+
+    fn readdir_entries(plus: bool) -> Vec<ReadDirEntry> {
+        (0..24)
+            .map(|index| ReadDirEntry {
+                file_id: index,
+                name: vec![b'n'; index as usize % 11 + 1],
+                cookie: index + 1,
+                extension: if plus {
+                    ReadDirEntryExtension::Plus {
+                        attributes: (index % 3 != 0).then(readdir_attributes),
+                        handle: (index % 5 != 0).then(|| vec![9; 45]),
+                    }
+                } else {
+                    ReadDirEntryExtension::Basic
+                },
+            })
+            .collect()
+    }
+
+    fn encoded_len(encode: impl FnOnce(&mut Encoder) -> Result<(), EncodeError>) -> usize {
+        let mut encoder = Encoder::new();
+        encode(&mut encoder).unwrap();
+        encoder.len()
+    }
+
+    /// The pre-streaming production policy, which sized every candidate by
+    /// fully encoding it. Kept as an oracle for `encode_readdir_reply`.
+    fn readdir_reference(
+        attributes: Option<&FileAttributes>,
+        entries: &[ReadDirEntry],
+        eof: bool,
+        limits: ReadDirLimits,
+    ) -> Vec<u8> {
+        let too_small = || {
+            let mut encoder = Encoder::new();
+            ReadDirResult::Err {
+                status: NfsStatus::TooSmall,
+                directory_attributes: attributes.cloned(),
+            }
+            .encode_result(&mut encoder)
+            .unwrap();
+            encoder.into_bytes()
+        };
+        let empty_size = |attributes: Option<&FileAttributes>| {
+            let empty = ReadDirResult::Ok {
+                directory_attributes: attributes.cloned(),
+                verifier: [3; 8],
+                entries: Vec::new(),
+                eof: false,
+            };
+            encoded_len(|encoder| empty.encode_result(encoder)) - 4
+        };
+        let mut selected = attributes;
+        if empty_size(selected) > limits.max_size {
+            selected = None;
+        }
+        if empty_size(selected) > limits.max_size {
+            return too_small();
+        }
+        let mut used = empty_size(selected);
+        let mut directory_used = 0;
+        let mut kept = Vec::new();
+        let mut truncated = false;
+        for entry in entries {
+            let basic = ReadDirEntry {
+                extension: ReadDirEntryExtension::Basic,
+                ..entry.clone()
+            };
+            let directory_bytes = encoded_len(|encoder| encode_readdir_entry(encoder, &basic));
+            let total_bytes = encoded_len(|encoder| encode_readdir_entry(encoder, entry));
+            if limits
+                .directory_size
+                .is_some_and(|limit| directory_used + directory_bytes + 4 > limit)
+                || used + total_bytes > limits.max_size
+            {
+                truncated = true;
+                break;
+            }
+            directory_used += directory_bytes;
+            used += total_bytes;
+            kept.push(entry.clone());
+        }
+        if truncated && kept.is_empty() {
+            return too_small();
+        }
+        let mut encoder = Encoder::new();
+        ReadDirResult::Ok {
+            directory_attributes: selected.cloned(),
+            verifier: [3; 8],
+            entries: kept,
+            eof: eof && !truncated,
+        }
+        .encode_result(&mut encoder)
+        .unwrap();
+        encoder.into_bytes()
+    }
+
+    #[test]
+    fn streaming_readdir_encoder_matches_the_reference_policy() {
+        let attributes = readdir_attributes();
+        for plus in [false, true] {
+            let entries = readdir_entries(plus);
+            for directory_attributes in [None, Some(&attributes)] {
+                for directory_size in [None, Some(0), Some(64), Some(300), Some(10_000)] {
+                    for max_size in (0..=3000).step_by(13) {
+                        for eof in [false, true] {
+                            let limits = ReadDirLimits {
+                                max_size,
+                                directory_size,
+                            };
+                            let mut actual = Encoder::new();
+                            encode_readdir_reply(
+                                &mut actual,
+                                directory_attributes,
+                                [3; 8],
+                                entries.clone(),
+                                eof,
+                                limits,
+                            )
+                            .unwrap();
+                            let actual = actual.into_bytes();
+                            let expected = readdir_reference(directory_attributes, &entries, eof, limits);
+                            assert_eq!(actual, expected, "plus={plus} limits={limits:?} eof={eof}");
+                            if actual[..4] == [0; 4] {
+                                assert!(actual.len() - 4 <= max_size);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn readdir_entries_are_only_pulled_while_they_fit() {
+        let entries = readdir_entries(true);
+        let mut pulled = 0;
+        let mut encoder = Encoder::new();
+        encode_readdir_reply(
+            &mut encoder,
+            None,
+            [0; 8],
+            entries.into_iter().inspect(|_| pulled += 1),
+            true,
+            ReadDirLimits {
+                max_size: 400,
+                directory_size: None,
+            },
+        )
+        .unwrap();
+        let reply = encoder.into_bytes();
+        let mut decoder = Decoder::new(&reply);
+        assert_eq!(decoder.read_u32(), Ok(NfsStatus::Ok as u32));
+        assert_eq!(decoder.read_bool(), Ok(false));
+        decoder.read_fixed::<8>().unwrap();
+        let mut kept = 0;
+        while decoder.read_bool().unwrap() {
+            kept += 1;
+            decoder.read_u64().unwrap();
+            decoder.read_opaque("name", 255).unwrap();
+            decoder.read_u64().unwrap();
+            if decoder.read_bool().unwrap() {
+                decoder.read_fixed::<FATTR3_SIZE>().unwrap();
+            }
+            if decoder.read_bool().unwrap() {
+                decoder.read_opaque("handle", 64).unwrap();
+            }
+        }
+        assert_eq!(decoder.read_bool(), Ok(false), "a truncated listing must not report eof");
+        decoder.finish().unwrap();
+        assert!(kept > 0);
+        assert_eq!(pulled, kept + 1, "only the first rejected entry may be pulled");
+    }
+
+    #[test]
+    fn readdir_without_room_for_one_entry_is_too_small_and_keeps_attributes() {
+        let attributes = readdir_attributes();
+        let mut encoder = Encoder::new();
+        encode_readdir_reply(
+            &mut encoder,
+            Some(&attributes),
+            [0; 8],
+            readdir_entries(false),
+            true,
+            ReadDirLimits {
+                max_size: EMPTY_READDIR_SIZE + 4,
+                directory_size: None,
+            },
+        )
+        .unwrap();
+        let reply = encoder.into_bytes();
+        let mut decoder = Decoder::new(&reply);
+        assert_eq!(decoder.read_u32(), Ok(NfsStatus::TooSmall as u32));
+        assert_eq!(decoder.read_bool(), Ok(true));
+        decoder.read_fixed::<FATTR3_SIZE>().unwrap();
+        decoder.finish().unwrap();
+
+        let mut empty_directory = Encoder::new();
+        encode_readdir_reply(
+            &mut empty_directory,
+            Some(&attributes),
+            [0; 8],
+            Vec::new(),
+            true,
+            ReadDirLimits {
+                max_size: EMPTY_READDIR_SIZE,
+                directory_size: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            empty_directory.into_bytes(),
+            [0u32, 0, 0, 0, 0, 1]
+                .iter()
+                .flat_map(|word| word.to_be_bytes())
+                .collect::<Vec<_>>(),
+            "an empty directory fits without attributes and reports eof"
+        );
     }
 }

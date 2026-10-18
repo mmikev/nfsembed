@@ -71,6 +71,21 @@ impl HandleCodec {
     }
 
     pub fn decode_any(&self, handle: &[u8]) -> Result<(ExportId, ObjectKey), HandleError> {
+        let encoded_export = self.peek_export(handle)?;
+        let mut mac = self.mac.clone();
+        mac.update(&handle[..PAYLOAD_SIZE]);
+        mac.verify_truncated_left(&handle[PAYLOAD_SIZE..])
+            .map_err(|_| HandleError::InvalidTag)?;
+        let file_id = u64::from_be_bytes(handle[13..21].try_into().map_err(|_| HandleError::InvalidLength)?);
+        let generation = u64::from_be_bytes(handle[21..29].try_into().map_err(|_| HandleError::InvalidLength)?);
+        Ok((encoded_export, ObjectKey { file_id, generation }))
+    }
+
+    /// Checks a handle's length, format, and server instance and returns its
+    /// export ID **without** verifying the integrity tag. This is only a
+    /// routing hint: every object must still be resolved through `decode`,
+    /// which authenticates the complete handle before the VFS sees it.
+    pub(crate) fn peek_export(&self, handle: &[u8]) -> Result<ExportId, HandleError> {
         if handle.len() != HANDLE_SIZE {
             return Err(HandleError::InvalidLength);
         }
@@ -80,14 +95,8 @@ impl HandleCodec {
         if handle[1..9] != self.instance_id {
             return Err(HandleError::StaleInstance);
         }
-        let encoded_export = u32::from_be_bytes(handle[9..13].try_into().map_err(|_| HandleError::InvalidLength)?);
-        let mut mac = self.mac.clone();
-        mac.update(&handle[..PAYLOAD_SIZE]);
-        mac.verify_truncated_left(&handle[PAYLOAD_SIZE..])
-            .map_err(|_| HandleError::InvalidTag)?;
-        let file_id = u64::from_be_bytes(handle[13..21].try_into().map_err(|_| HandleError::InvalidLength)?);
-        let generation = u64::from_be_bytes(handle[21..29].try_into().map_err(|_| HandleError::InvalidLength)?);
-        Ok((ExportId(encoded_export), ObjectKey { file_id, generation }))
+        let export = handle[9..13].try_into().map_err(|_| HandleError::InvalidLength)?;
+        Ok(ExportId(u32::from_be_bytes(export)))
     }
 
     pub fn instance_id(&self) -> [u8; INSTANCE_SIZE] {
@@ -141,6 +150,32 @@ mod tests {
         );
         handle[15] ^= 1;
         assert_eq!(codec.decode(ExportId(1), &handle), Err(HandleError::InvalidTag));
+    }
+
+    #[test]
+    fn malformed_handles_are_classified_before_tag_verification() {
+        let codec = HandleCodec::random();
+        let handle = codec.encode(
+            ExportId(5),
+            ObjectKey {
+                file_id: 1,
+                generation: 1,
+            },
+        );
+        assert_eq!(codec.decode(ExportId(5), &handle[..HANDLE_SIZE - 1]), Err(HandleError::InvalidLength));
+        assert_eq!(codec.decode(ExportId(5), &[handle.as_slice(), &[0]].concat()), Err(HandleError::InvalidLength));
+        let mut wrong_format = handle;
+        wrong_format[0] = FORMAT_VERSION + 1;
+        assert_eq!(codec.decode(ExportId(5), &wrong_format), Err(HandleError::InvalidFormat));
+        assert_eq!(codec.peek_export(&handle), Ok(ExportId(5)));
+        assert_eq!(HandleCodec::random().peek_export(&handle), Err(HandleError::StaleInstance));
+
+        // The routing hint is unauthenticated: a forged export ID is still
+        // rejected when the handle is decoded for that export.
+        let mut forged_export = handle;
+        forged_export[12] ^= 1;
+        assert_eq!(codec.peek_export(&forged_export), Ok(ExportId(4)));
+        assert_eq!(codec.decode(ExportId(4), &forged_export), Err(HandleError::InvalidTag));
     }
 
     #[test]

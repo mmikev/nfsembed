@@ -25,22 +25,22 @@ fuzz_target!(|data: &[u8]| {
         // machine below.
         let transitions = Arc::new(ReplayCache::new(2, 4096, Duration::ZERO));
         let fingerprint = RequestFingerprint([data.first().copied().unwrap_or_default(); 32]);
-        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(100), fingerprint).await {
-            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(100), fingerprint).await {
+        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(100), fingerprint) {
+            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(100), fingerprint) {
                 let task = tokio::spawn(async move { waiter.await });
                 tokio::task::yield_now().await;
                 leader.complete(Bytes::copy_from_slice(data.get(..data.len().min(32)).unwrap_or_default()));
                 let _ = task.await;
             }
         }
-        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(101), fingerprint).await {
-            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(101), fingerprint).await {
+        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(101), fingerprint) {
+            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(101), fingerprint) {
                 drop(leader);
                 let _ = waiter.await;
             }
         }
-        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(102), fingerprint).await {
-            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(102), fingerprint).await {
+        if let Ok(ReplayDecision::Execute(leader)) = transitions.begin(replay_key(102), fingerprint) {
+            if let Ok(ReplayDecision::Wait(waiter)) = transitions.begin(replay_key(102), fingerprint) {
                 drop(waiter);
             }
             drop(leader);
@@ -54,7 +54,7 @@ fuzz_target!(|data: &[u8]| {
             let xid = u32::from(chunk.first().copied().unwrap_or_default() % 8);
             let marker = chunk.get(1).copied().unwrap_or_default();
             let action = chunk.get(2).copied().unwrap_or_default();
-            let decision = cache.begin(replay_key(xid), RequestFingerprint([marker; 32])).await;
+            let decision = cache.begin(replay_key(xid), RequestFingerprint([marker; 32]));
             match decision {
                 Ok(ReplayDecision::Execute(lease)) if action & 1 == 0 => {
                     lease.complete(Bytes::copy_from_slice(chunk));
