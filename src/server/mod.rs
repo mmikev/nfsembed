@@ -16,6 +16,8 @@ use connection::{serve_connection, ConnectionState};
 pub use handle::{MountInfo, ServerHandle};
 pub use limits::ServerLimits;
 pub use portmapper::PortmapperSockets;
+use rand::rngs::OsRng;
+use rand::RngCore;
 use tokio::net::TcpListener;
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::{JoinError, JoinSet};
@@ -235,6 +237,8 @@ impl NfsServer {
 
     fn connection_state(&self, local_port: u16) -> Result<(Arc<ConnectionState>, Arc<ExecutionTracker>), ServerError> {
         let executions = Arc::new(ExecutionTracker::new());
+        let mut fingerprint_seed = [0; 8];
+        OsRng.try_fill_bytes(&mut fingerprint_seed)?;
         let state = Arc::new(ConnectionState {
             exports: self.exports.clone(),
             limits: self.limits.clone(),
@@ -248,6 +252,7 @@ impl NfsServer {
                 self.limits.replay_cache_max_bytes,
                 self.limits.replay_cache_ttl,
             )),
+            fingerprint_seed: u64::from_ne_bytes(fingerprint_seed),
             requests: Arc::new(Semaphore::new(self.limits.max_inflight_requests)),
             request_buffers: Arc::new(Semaphore::new(self.limits.max_buffered_request_bytes)),
             reply_buffers: Arc::new(Semaphore::new(self.limits.max_buffered_reply_bytes)),

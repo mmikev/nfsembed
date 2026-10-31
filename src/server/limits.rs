@@ -17,6 +17,8 @@ const MAXIMUM_WRITE_RECORD_OVERHEAD: usize =
     MAX_VALID_RPC_CALL_PREFIX_SIZE + WRITE_ARGUMENT_FIXED_SIZE + WRITE_PADDING_ALLOWANCE;
 const MAXIMUM_READ_REPLY_OVERHEAD: usize = 24 + 4 + 88 + 4 + 4 + 4 + 3;
 const READDIR_REPLY_OVERHEAD: usize = 24 + 4;
+/// Holds a 1 MiB READ reply or WRITE call in one fragment, with room to spare.
+const DEFAULT_RPC_RECORD_SIZE: usize = 2 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ServerLimits {
@@ -24,6 +26,12 @@ pub struct ServerLimits {
     pub max_requests_per_connection: usize,
     pub max_inflight_requests: usize,
     pub max_rpc_record_size: usize,
+    /// The largest record fragment accepted or sent. Clients send each call
+    /// as a single fragment, so this also bounds the largest call: it must
+    /// hold a `max_write_size` WRITE, and any other call over it, such as a
+    /// SYMLINK with a long target under a small limit, is answered with
+    /// `SYSTEM_ERR`. At 8 KiB or more it holds every other NFSv3 or MOUNT
+    /// call a kernel client sends.
     pub max_rpc_fragment_size: usize,
     pub max_fragments_per_record: usize,
     pub max_buffered_request_bytes: usize,
@@ -46,8 +54,8 @@ impl ServerLimits {
             max_connections: 1024,
             max_requests_per_connection: 32,
             max_inflight_requests: 2048,
-            max_rpc_record_size: 2 * 1024 * 1024,
-            max_rpc_fragment_size: 1024 * 1024,
+            max_rpc_record_size: DEFAULT_RPC_RECORD_SIZE,
+            max_rpc_fragment_size: DEFAULT_RPC_RECORD_SIZE,
             max_fragments_per_record: 16,
             max_buffered_request_bytes: 64 * 1024 * 1024,
             max_buffered_reply_bytes: 64 * 1024 * 1024,
@@ -108,16 +116,21 @@ impl ServerLimits {
         }
         let transport_capacity = self.transport_record_capacity();
         let read_capacity = transport_capacity.saturating_sub(MAXIMUM_READ_REPLY_OVERHEAD);
-        let write_capacity = transport_capacity.saturating_sub(MAXIMUM_WRITE_RECORD_OVERHEAD);
         let readdir_capacity = transport_capacity.saturating_sub(READDIR_REPLY_OVERHEAD);
         if self.max_read_size == 0
             || self.max_write_size == 0
             || self.max_readdir_response_size == 0
             || self.max_read_size as usize > read_capacity
-            || self.max_write_size as usize > write_capacity
             || self.max_readdir_response_size as usize > readdir_capacity
         {
             return Err("transfer limits exceed the effective RPC transport capacity");
+        }
+        // Clients send each call as one fragment, so a WRITE of the size that
+        // FSINFO offers must fit in one; the fragment limit is at most the
+        // record limit. Replies may span fragments, because the server splits
+        // them itself and clients reassemble them.
+        if self.max_write_size as usize > self.max_rpc_fragment_size.saturating_sub(MAXIMUM_WRITE_RECORD_OVERHEAD) {
+            return Err("a max_write_size WRITE call must fit in one RPC fragment");
         }
         Ok(())
     }
@@ -436,6 +449,34 @@ mod tests {
         assert!(limits.validate().is_ok());
 
         limits.max_write_size += 1;
+        assert_eq!(limits.validate(), Err("a max_write_size WRITE call must fit in one RPC fragment"));
+        limits.max_write_size -= 1;
+        limits.max_read_size += 1;
         assert_eq!(limits.validate(), Err("transfer limits exceed the effective RPC transport capacity"));
+    }
+
+    #[test]
+    fn a_maximum_size_write_fits_in_one_fragment() {
+        let defaults = ServerLimits::production_defaults();
+        assert!(defaults.validate().is_ok());
+        assert_eq!(defaults.max_rpc_fragment_size, defaults.max_rpc_record_size);
+        assert!(defaults.max_write_size as usize + MAXIMUM_WRITE_RECORD_OVERHEAD <= defaults.max_rpc_fragment_size);
+
+        // The 0.2 defaults offered 1 MiB WRITEs, whose calls exceed the 1 MiB
+        // fragment limit, although 16 fragments could carry them.
+        let mut limits = defaults.clone();
+        limits.max_rpc_fragment_size = 1024 * 1024;
+        assert!(limits.transport_record_capacity() >= limits.max_write_size as usize + MAXIMUM_WRITE_RECORD_OVERHEAD);
+        assert_eq!(limits.validate(), Err("a max_write_size WRITE call must fit in one RPC fragment"));
+        limits.max_write_size = (limits.max_rpc_fragment_size - MAXIMUM_WRITE_RECORD_OVERHEAD) as u32;
+        assert!(limits.validate().is_ok());
+
+        // READ and READDIR replies may still span fragments.
+        let mut limits = defaults;
+        limits.max_rpc_fragment_size = 64 * 1024;
+        limits.max_fragments_per_record = 32;
+        limits.max_write_size = (64 * 1024 - MAXIMUM_WRITE_RECORD_OVERHEAD) as u32;
+        assert!(limits.max_read_size as usize > limits.max_rpc_fragment_size);
+        assert!(limits.validate().is_ok());
     }
 }

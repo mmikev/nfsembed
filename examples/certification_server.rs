@@ -13,7 +13,7 @@ use std::time::Duration;
 use certification_vfs::{CertificationProfile, CertificationVfs};
 use nfsembed::rpc::codec::Decoder;
 use nfsembed::rpc::record::{read_record, write_record_limited, RecordLimits};
-use nfsembed::{AuthPolicy, ExportId, NfsServer, PortmapperSockets, VirtualFileSystem};
+use nfsembed::{AuthPolicy, ExportId, NfsServer, PortmapperSockets, ServerLimits, VirtualFileSystem};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::task::JoinSet;
 
@@ -142,10 +142,14 @@ async fn proxy_connection(
     lose_reply: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut upstream = TcpStream::connect(upstream_address).await?;
+    // The server runs with the default limits; the proxy must pass every call
+    // and reply that they allow, such as a 1 MiB WRITE or READ reply sent as
+    // one fragment just over 1 MiB.
+    let server_limits = ServerLimits::production_defaults();
     let limits = RecordLimits {
-        max_record_size: 2 * 1024 * 1024,
-        max_fragment_size: 1024 * 1024,
-        max_fragments: 16,
+        max_record_size: server_limits.max_rpc_record_size,
+        max_fragment_size: server_limits.max_rpc_fragment_size,
+        max_fragments: server_limits.max_fragments_per_record,
     };
     loop {
         let request = read_record(&mut client, limits).await?;

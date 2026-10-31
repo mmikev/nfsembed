@@ -4,9 +4,11 @@ use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
 use nfsembed::rpc::codec::Encoder;
+use nfsembed::server::{AuthPolicy, PortmapperMode, ServerLimits};
 use nfsembed::vfs::ExportId;
 use support::rpc::{
-    mount_root, nfs_args_directory, nfs_args_handle, start_server, RpcClient, NFS_PROGRAM, NFS_VERSION,
+    mount_root, nfs_args_directory, nfs_args_handle, start_server, start_server_with, RpcClient, RpcOutcome,
+    NFS_PROGRAM, NFS_VERSION,
 };
 use support::vfs::ConformanceVfs;
 use tracing_subscriber::fmt::MakeWriter;
@@ -81,7 +83,38 @@ async fn tracing_contains_stable_operational_fields_without_sensitive_payloads()
 
     server.shutdown().await;
 
+    // A refused call leaves its connection open, so a peer can repeat it
+    // indefinitely; only the first refusal on a connection is a warning.
+    let mut limits = ServerLimits::production_defaults();
+    limits.max_rpc_fragment_size = 1024;
+    limits.max_rpc_record_size = 2048;
+    limits.max_read_size = 100;
+    limits.max_write_size = 400;
+    limits.max_readdir_response_size = 600;
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    let small = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let mut refused = RpcClient::connect(small.address).await;
+    for xid in [910, 911] {
+        // One fragment over the 1 KiB fragment limit.
+        assert!(matches!(
+            refused.call_with_xid(xid, NFS_PROGRAM, NFS_VERSION, 0, &[0; 1100]).await,
+            RpcOutcome::Accepted { xid: reply_xid, status: 5, .. } if reply_xid == xid
+        ));
+    }
+    small.shutdown().await;
+
     let output = String::from_utf8(buffer.lock().unwrap().clone()).unwrap();
+    // Each line starts with its level.
+    let refusals: Vec<_> = output
+        .lines()
+        .filter(|line| line.contains("RPC record refused"))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect();
+    assert_eq!(
+        refusals,
+        ["WARN", "DEBUG"],
+        "only the first refusal on a connection may warn, and later ones are still logged:\n{output}"
+    );
     for required in [
         "connection opened",
         "connection closed",

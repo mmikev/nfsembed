@@ -15,6 +15,9 @@ pub const MOUNT_VERSION: u32 = 3;
 pub const PORTMAP_PROGRAM: u32 = 100_000;
 pub const PORTMAP_VERSION: u32 = 2;
 
+/// Like the Linux, macOS, and FreeBSD clients, send each call as one fragment.
+const CALL_FRAGMENT_SIZE: usize = 0x7fff_ffff;
+
 const RECORD_LIMITS: RecordLimits = RecordLimits {
     max_record_size: 4 * 1024 * 1024,
     max_fragment_size: 2 * 1024 * 1024,
@@ -85,7 +88,7 @@ impl RpcClient {
         arguments: &[u8],
     ) -> RpcOutcome {
         let request = rpc_call(xid, 2, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
+        write_record(&mut self.stream, &request, CALL_FRAGMENT_SIZE).await.unwrap();
         self.read_reply().await
     }
 
@@ -99,7 +102,7 @@ impl RpcClient {
         arguments: &[u8],
     ) -> RpcOutcome {
         let request = rpc_call(xid, rpc_version, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
+        write_record(&mut self.stream, &request, CALL_FRAGMENT_SIZE).await.unwrap();
         self.read_reply().await
     }
 
@@ -125,7 +128,7 @@ impl RpcClient {
             verifier_flavor,
             verifier,
         );
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
+        write_record(&mut self.stream, &request, CALL_FRAGMENT_SIZE).await.unwrap();
         self.read_reply().await
     }
 
@@ -138,7 +141,7 @@ impl RpcClient {
         arguments: &[u8],
     ) {
         let request = rpc_call(xid, 2, program, version, procedure, arguments, &self.auth);
-        write_record(&mut self.stream, &request, 1024 * 1024).await.unwrap();
+        write_record(&mut self.stream, &request, CALL_FRAGMENT_SIZE).await.unwrap();
     }
 
     pub async fn read_reply(&mut self) -> RpcOutcome {

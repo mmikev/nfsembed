@@ -91,6 +91,10 @@ fn builder_rejects_every_unbounded_or_ambiguous_configuration() {
     limits.max_write_size = 494;
     limits.max_readdir_response_size = 100;
     invalid_limits.push(limits);
+    // The 0.2 defaults: a 1 MiB WRITE call needs a fragment over 1 MiB.
+    let mut limits = base.clone();
+    limits.max_rpc_fragment_size = 1024 * 1024;
+    invalid_limits.push(limits);
     let mut limits = base;
     limits.max_mounts = 0;
     invalid_limits.push(limits);
@@ -445,16 +449,19 @@ async fn wait_is_cancellation_safe_and_concurrent_waiters_observe_termination() 
 
 #[tokio::test]
 async fn oversized_and_overfragmented_outbound_replies_become_system_errors() {
-    for (record_size, fragment_size, fragments) in [(640, 640, 8), (1024, 256, 3)] {
+    // The DUMP and EXPORT replies below are about 1.4 KiB: larger than the
+    // first record limit and than two fragments of the second, but smaller
+    // than its record limit. A fragment must still hold a WRITE call.
+    for (record_size, fragment_size, fragments, write_size) in [(640, 640, 8, 100), (2048, 600, 2, 64)] {
         let mut limits = ServerLimits::production_defaults();
         limits.max_rpc_record_size = record_size;
         limits.max_rpc_fragment_size = fragment_size;
         limits.max_fragments_per_record = fragments;
         limits.max_read_size = 100;
-        limits.max_write_size = 100;
+        limits.max_write_size = write_size;
         limits.max_readdir_response_size = 600;
         let mut builder = NfsServer::builder(ConformanceVfs::new(ExportId(1))).limits(limits);
-        for id in 2..=24 {
+        for id in 2..=34 {
             builder = builder.add_export(
                 ExportId(id),
                 format!("export-{id}-with-a-long-name"),
@@ -463,7 +470,7 @@ async fn oversized_and_overfragmented_outbound_replies_become_system_errors() {
         }
         let running = start_built_server(builder.build().unwrap()).await;
         let mut client = RpcClient::connect(running.address).await;
-        for id in 2..=20 {
+        for id in 2..=30 {
             let mut path = Encoder::new();
             path.write_opaque(format!("/export-{id}-with-a-long-name").as_bytes()).unwrap();
             assert_eq!(
@@ -715,6 +722,38 @@ async fn completed_inflight_lost_reply_and_xid_reuse_paths_are_end_to_end_correc
     );
     assert_eq!(first_reply, second_reply);
     assert_eq!(vfs.call_count("setattr"), inflight_baseline + 1);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn large_write_replay_detection_covers_the_whole_payload() {
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    let server = start_server(vfs.clone()).await;
+    let mut client = RpcClient::connect(server.address).await;
+    let root = mount_root(&mut client, b"/").await;
+    let file = lookup_handle(&mut client, &root, b"file").await;
+
+    // Most of this payload lies past the part of the arguments that is
+    // fingerprinted with SHA-256.
+    let mut data = (0..256 * 1024).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+    let baseline = vfs.call_count("write");
+    let first = client
+        .call_with_xid(700, NFS_PROGRAM, NFS_VERSION, 7, &write_arguments(&file, &data))
+        .await;
+    let retransmitted = client
+        .call_with_xid(700, NFS_PROGRAM, NFS_VERSION, 7, &write_arguments(&file, &data))
+        .await;
+    assert_eq!(first, retransmitted);
+    assert_eq!(vfs.call_count("write"), baseline + 1, "a retransmitted WRITE executed again");
+
+    *data.last_mut().unwrap() ^= 1;
+    let reused = client
+        .call_with_xid(700, NFS_PROGRAM, NFS_VERSION, 7, &write_arguments(&file, &data))
+        .await;
+    assert_nfs_status(reused, 0);
+    assert_eq!(vfs.call_count("write"), baseline + 2, "a WRITE with a different last byte was replayed");
+    assert_eq!(vfs.last_write().unwrap().data, data);
 
     server.shutdown().await;
 }
@@ -1211,36 +1250,107 @@ async fn large_read_and_write_records_cross_transport_without_truncation() {
 }
 
 #[tokio::test]
-async fn hostile_fragments_close_only_their_connection_and_server_stays_healthy() {
+async fn default_limits_accept_a_maximum_size_write_sent_as_one_fragment() {
+    let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
+    let server = start_server(vfs.clone()).await;
+    let mut client = RpcClient::connect(server.address).await;
+    let root = mount_root(&mut client, b"/").await;
+    let file = lookup_handle(&mut client, &root, b"file").await;
+    let max_write = ServerLimits::production_defaults().max_write_size;
+
+    // The test client, like Linux, sends this WRITE as a single fragment a
+    // little over `max_write` bytes.
+    let data = vec![0x5a; max_write as usize];
+    let payload = assert_nfs_status(client.call(NFS_PROGRAM, NFS_VERSION, 7, &write_arguments(&file, &data)).await, 0);
+    let mut decoder = Decoder::new(&payload[4..]);
+    let _ = support::rpc::decode_wcc(&mut decoder);
+    assert_eq!(decoder.read_u32().unwrap(), max_write);
+    assert_eq!(vfs.last_write().unwrap().data.len(), max_write as usize);
+
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn oversized_single_fragment_calls_get_system_err_and_other_violations_close_only_their_connection() {
     let mut limits = ServerLimits::production_defaults();
-    limits.max_rpc_fragment_size = 256;
-    limits.max_rpc_record_size = 640;
+    limits.max_rpc_fragment_size = 1024;
+    limits.max_rpc_record_size = 2048;
     limits.max_fragments_per_record = 3;
     limits.max_read_size = 100;
-    limits.max_write_size = 100;
+    limits.max_write_size = 400;
     limits.max_readdir_response_size = 600;
     let vfs = Arc::new(ConformanceVfs::new(ExportId(1)));
-    let server = start_server_with(vfs, limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let server = start_server_with(vfs.clone(), limits, AuthPolicy::AuthSys, PortmapperMode::Disabled).await;
+    let mut client = RpcClient::connect(server.address).await;
+    let root = mount_root(&mut client, b"/").await;
+    let file = lookup_handle(&mut client, &root, b"file").await;
 
-    let mut oversized = TcpStream::connect(server.address).await.unwrap();
-    oversized.write_all(&record_header(257, true)).await.unwrap();
-    let mut byte = [0];
-    let result = tokio::time::timeout(Duration::from_secs(1), oversized.read(&mut byte))
-        .await
-        .unwrap();
-    assert!(matches!(result, Ok(0) | Err(_)));
-
-    let mut fragmented = TcpStream::connect(server.address).await.unwrap();
-    let mut fragments = Vec::new();
-    for value in [1u8, 2, 3, 4] {
-        fragments.extend_from_slice(&record_header(1, false));
-        fragments.push(value);
+    // A WRITE over the fragment limit, sent as one fragment as kernel clients
+    // send every call, is answered on its connection, so a client fails it
+    // instead of reconnecting to resend it.
+    let writes = vfs.call_count("write");
+    let oversized = write_arguments(&file, &[7; 1000]);
+    for _ in 0..3 {
+        assert!(matches!(
+            client.call_with_xid(800, NFS_PROGRAM, NFS_VERSION, 7, &oversized).await,
+            RpcOutcome::Accepted {
+                xid: 800,
+                status: 5,
+                ..
+            }
+        ));
     }
-    fragmented.write_all(&fragments).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(1), fragmented.read(&mut byte))
-        .await
-        .unwrap();
-    assert!(matches!(result, Ok(0) | Err(_)));
+    assert_eq!(vfs.call_count("write"), writes, "a refused WRITE executed");
+    assert_nfs_status(
+        client
+            .call(NFS_PROGRAM, NFS_VERSION, 7, &write_arguments(&file, &[7; 400]))
+            .await,
+        0,
+    );
+
+    // Every other limit violation, and broken framing, closes only its own
+    // connection, as soon as it is seen rather than when the record ends.
+    let call = rpc_call(801, 2, NFS_PROGRAM, NFS_VERSION, 0, &[], &Auth::Sys);
+    let mut too_many_fragments = Vec::new();
+    for (index, chunk) in call.chunks(call.len().div_ceil(4)).enumerate() {
+        too_many_fragments.extend_from_slice(&record_header(chunk.len(), index == 3));
+        too_many_fragments.extend_from_slice(chunk);
+    }
+    let mut unfinished = Vec::new();
+    for value in [1u8, 2, 3, 4] {
+        unfinished.extend_from_slice(&record_header(1, false));
+        unfinished.push(value);
+    }
+    let mut first_fragment_too_large = record_header(1025, false).to_vec();
+    first_fragment_too_large.extend_from_slice(&[0; 1025]);
+    let mut record_too_large = Vec::new();
+    for last in [false, false, true] {
+        record_too_large.extend_from_slice(&record_header(1000, last));
+        record_too_large.extend_from_slice(&[0; 1000]);
+    }
+    let mut truncated = record_header(4096, true).to_vec();
+    truncated.extend_from_slice(&[0; 100]);
+    for (violation, bytes, end_stream) in [
+        ("too many fragments", too_many_fragments, false),
+        ("unfinished record past the fragment count", unfinished, false),
+        ("first of several fragments over the fragment limit", first_fragment_too_large, false),
+        ("fragments over the record limit", record_too_large, false),
+        ("empty non-final fragment", record_header(0, false).to_vec(), false),
+        ("stream ending inside a refused record", truncated, true),
+    ] {
+        let mut stream = TcpStream::connect(server.address).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        if end_stream {
+            stream.shutdown().await.unwrap();
+        }
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap_or_else(|_| panic!("{violation}: the connection stayed open"));
+        assert!(matches!(result, Ok(0) | Err(_)), "{violation}: the server replied");
+    }
+    let (status, _) = client.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
+    assert_eq!(status, 0);
 
     let mut healthy = RpcClient::connect(server.address).await;
     let (status, payload) = healthy.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
