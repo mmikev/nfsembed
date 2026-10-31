@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot, watch, Mutex, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::Instrument;
+use twox_hash::XxHash3_128;
 
 use super::limits::MAXIMUM_FIXED_REPLY_SIZE;
 use super::{AuthPolicy, ExecutionTracker, ExportState, PortmapperMode, ServerError, ServerLimits};
@@ -29,7 +30,10 @@ use crate::replay::{ReplayDecision, ReplayKey, RequestFingerprint};
 use crate::rpc::auth::{decode_principal, AUTH_NONE, AUTH_SYS};
 use crate::rpc::codec::{Decoder, EncodeError};
 use crate::rpc::message::{self, AcceptStatus, AuthStatus, CallHeader, VersionRange, ACCEPTED_REPLY_HEADER_SIZE};
-use crate::rpc::record::{read_record_budgeted, validate_record_length, write_record_segments_limited, RecordLimits};
+use crate::rpc::record::{
+    read_record_budgeted, validate_record_length, write_record_segments_limited, InboundRecord, RecordError,
+    RecordLimits,
+};
 use crate::rpc::reply::EncodedReply;
 use crate::vfs::{
     CreatedObject, ExportId, FileAttributes, FileType, FsInfo, MutationResult, NfsError, NfsName, ObjectKey, Principal,
@@ -47,6 +51,8 @@ const FSF3_HOMOGENEOUS: u32 = 0x0008;
 const FSF3_CANSETTIME: u32 = 0x0010;
 /// The smallest READDIR `count` that can hold an empty listing.
 const MINIMUM_READDIR_COUNT: usize = 20;
+/// How many leading argument bytes `request_fingerprint` hashes with SHA-256.
+const FINGERPRINT_SHA256_PREFIX: usize = 1024;
 
 pub(crate) struct ConnectionState {
     pub exports: Arc<Vec<ExportState>>,
@@ -55,6 +61,8 @@ pub(crate) struct ConnectionState {
     pub portmapper: PortmapperMode,
     pub handles: HandleCodec,
     pub replay: Arc<crate::replay::ReplayCache>,
+    /// Seeds the payload digest in `request_fingerprint`.
+    pub fingerprint_seed: u64,
     pub requests: Arc<Semaphore>,
     pub request_buffers: Arc<Semaphore>,
     pub reply_buffers: Arc<Semaphore>,
@@ -66,9 +74,19 @@ pub(crate) struct ConnectionState {
 type MountTable = Arc<Mutex<Vec<(IpAddr, Vec<u8>)>>>;
 
 struct QueuedRequest {
-    record: Vec<u8>,
-    budget: OwnedSemaphorePermit,
+    call: QueuedCall,
     deadline: Instant,
+}
+
+enum QueuedCall {
+    Record {
+        record: Vec<u8>,
+        budget: OwnedSemaphorePermit,
+    },
+    /// A call that the record layer discarded for exceeding its limits. It
+    /// is answered with `SYSTEM_ERR`, so the client fails the call rather
+    /// than reconnecting to resend it.
+    Refused { xid: u32, reason: RecordError },
 }
 
 struct QueuedReply {
@@ -118,7 +136,7 @@ async fn connection_reader(
             return Ok(());
         }
         let read = timeout(idle_timeout, read_record_budgeted(&mut reader, limits, request_buffers.clone()));
-        let (record, budget) = tokio::select! {
+        let call = tokio::select! {
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return Ok(());
@@ -127,13 +145,19 @@ async fn connection_reader(
             },
             result = read => match result {
                 Err(_) => return Ok(()),
-                Ok(Err(crate::rpc::record::RecordError::Io(error)))
+                Ok(Err(RecordError::Io(error)))
                     if matches!(
                         error.kind(),
                         std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
                     ) => return Ok(()),
                 Ok(Err(error)) => return Err(ServerError::Record(error)),
-                Ok(Ok(record)) => record,
+                Ok(Ok(InboundRecord::Accepted { record, budget })) => QueuedCall::Record { record, budget },
+                Ok(Ok(InboundRecord::Refused { xid: Some(xid), reason })) => QueuedCall::Refused { xid, reason },
+                Ok(Ok(InboundRecord::Refused { xid: None, reason })) => {
+                    // A reply cannot name a record shorter than an XID.
+                    tracing::debug!(error = %reason, "RPC record without an XID refused");
+                    continue;
+                },
             },
         };
         tokio::select! {
@@ -143,8 +167,7 @@ async fn connection_reader(
                 }
             },
             result = timeout(progress_timeout, sender.send(QueuedRequest {
-                record,
-                budget,
+                call,
                 deadline: Instant::now() + progress_timeout,
             })) => {
                 match result {
@@ -262,19 +285,23 @@ async fn handle_request(
     state: Arc<ConnectionState>,
     reply_sender: mpsc::Sender<QueuedReply>,
 ) -> Result<(), ServerError> {
-    let QueuedRequest {
-        record,
-        budget: request_budget,
-        deadline,
-    } = request;
-    let record = Bytes::from(record);
-    let xid = record
-        .get(..4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map_or(0, u32::from_be_bytes);
-    let call = RpcCall::decode(&record);
+    let QueuedRequest { call, deadline } = request;
+    let (xid, call) = match call {
+        QueuedCall::Record { record, budget } => {
+            let record = Bytes::from(record);
+            let xid = record
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map_or(0, u32::from_be_bytes);
+            (xid, RpcCall::decode(&record).map(|call| (record, call, budget)))
+        },
+        QueuedCall::Refused { xid, reason } => {
+            tracing::warn!(client = %client_addr, xid, error = %reason, "RPC record refused");
+            (xid, Err(ServerError::Record(reason)))
+        },
+    };
     let reservation = match &call {
-        Ok(call) => {
+        Ok((record, call, _)) => {
             let CallHeader {
                 program,
                 version,
@@ -295,7 +322,7 @@ async fn handle_request(
         .map_err(|_| ServerError::ShuttingDown)?;
     let reply_budget = Arc::new(reply_budget);
     let reply = match call {
-        Ok(call) => {
+        Ok((record, call, request_budget)) => {
             let execution = Execution {
                 request_budget,
                 reply_budget: reply_budget.clone(),
@@ -359,10 +386,8 @@ async fn dispatch_record(
             export_id,
             xid,
         };
-        match state
-            .replay
-            .begin(replay_key, request_fingerprint(header, &arguments, &principal))?
-        {
+        let fingerprint = request_fingerprint(header, &arguments, &principal, state.fingerprint_seed);
+        match state.replay.begin(replay_key, fingerprint)? {
             ReplayDecision::Replay(reply) => {
                 tracing::debug!(xid, client = %client_addr, replay = "hit", "RPC reply replayed");
                 return Ok(reply);
@@ -448,12 +473,40 @@ fn requires_replay_protection(header: CallHeader) -> bool {
         && Procedure::from_wire(header.procedure).is_some_and(Procedure::is_non_idempotent)
 }
 
-fn request_fingerprint(header: CallHeader, arguments: &[u8], principal: &Principal) -> RequestFingerprint {
+/// Identifies a call's content for the replay cache. Fingerprints are only
+/// compared between calls that share a client address, export, and XID, and
+/// an equal fingerprint replays the earlier reply, so a collision would
+/// acknowledge a call that never executed.
+///
+/// On an Apple M1 Pro, SHA-256 over a whole 1 MiB WRITE takes about 0.5 ms
+/// with the ARMv8 SHA-2 instructions and 3 ms without them, more than the rest
+/// of the request path. Hence SHA-256 covers the program, version, procedure,
+/// argument length, principal, and the first `FINGERPRINT_SHA256_PREFIX`
+/// argument bytes: the complete arguments of nearly every call, and the file
+/// handle, offset, count, stability, and data length of a WRITE. The
+/// remaining bytes, in practice WRITE data, enter it as their XXH3-128 digest
+/// under a per-server random seed, which hashes 1 MiB in about 0.03 ms. Every
+/// argument byte still contributes (Linux's nfsd, by contrast, checksums only
+/// the first 256 bytes of a call).
+///
+/// The trade-off is that XXH3 resists accidental collisions, about 2^-128 for
+/// two different payloads, but not payloads crafted to collide. That costs
+/// nothing here: crafting such a pair takes calls from the victim's address
+/// with the victim's XIDs, and a sender that can do that can already issue
+/// any call it likes, because AUTH_SYS credentials are not authenticated.
+/// The seed keeps a colliding pair from being reproducible across server runs.
+fn request_fingerprint(header: CallHeader, arguments: &[u8], principal: &Principal, seed: u64) -> RequestFingerprint {
+    let (prefix, payload) = arguments.split_at(arguments.len().min(FINGERPRINT_SHA256_PREFIX));
     let mut hasher = Sha256::new();
     hasher.update(header.program.to_be_bytes());
     hasher.update(header.version.to_be_bytes());
     hasher.update(header.procedure.to_be_bytes());
-    hasher.update(arguments);
+    // The length also fixes where the prefix ends.
+    hasher.update((arguments.len() as u64).to_be_bytes());
+    hasher.update(prefix);
+    if !payload.is_empty() {
+        hasher.update(XxHash3_128::oneshot_with_seed(seed, payload).to_be_bytes());
+    }
     hash_principal(&mut hasher, principal);
     RequestFingerprint(hasher.finalize().into())
 }
@@ -1453,6 +1506,62 @@ mod tests {
             assert!(!requires_replay_protection(header(crate::mount3::types::PROGRAM, 3, procedure)));
         }
         assert!(!requires_replay_protection(header(crate::portmap::PROGRAM, 2, 3)));
+    }
+
+    #[test]
+    fn fingerprints_cover_every_byte_of_a_large_write() {
+        let header = CallHeader {
+            xid: 1,
+            rpc_version: 2,
+            program: crate::nfs3::types::PROGRAM,
+            version: crate::nfs3::types::VERSION,
+            procedure: Procedure::Write as u32,
+        };
+        let principal = Principal::AuthSys {
+            uid: 1000,
+            gid: 1000,
+            supplementary_gids: vec![4, 27],
+            machine_name: b"client".to_vec(),
+        };
+        let fingerprint = |arguments: &[u8]| request_fingerprint(header, arguments, &principal, 7);
+        let arguments = (0..(1 << 20) + 120).map(|index| (index % 251) as u8).collect::<Vec<_>>();
+        let original = fingerprint(&arguments);
+        assert_eq!(fingerprint(&arguments.clone()), original, "a retransmission must match");
+
+        let last = arguments.len() - 1;
+        for index in [
+            0,
+            87,
+            FINGERPRINT_SHA256_PREFIX - 1,
+            FINGERPRINT_SHA256_PREFIX,
+            last / 2,
+            last,
+        ] {
+            let mut changed = arguments.clone();
+            changed[index] ^= 1;
+            assert_ne!(fingerprint(&changed), original, "byte {index} is not covered");
+        }
+        let mut extended = arguments.clone();
+        extended.push(0);
+        assert_ne!(fingerprint(&extended), original, "a trailing zero byte is not covered");
+        assert_ne!(fingerprint(&arguments[..last]), original, "a truncated payload is not covered");
+        // Moving bytes across the prefix boundary changes the length.
+        let boundary = &arguments[..FINGERPRINT_SHA256_PREFIX + 1];
+        assert_ne!(fingerprint(boundary), fingerprint(&boundary[..FINGERPRINT_SHA256_PREFIX]));
+
+        let other_procedure = CallHeader {
+            procedure: Procedure::SetAttr as u32,
+            ..header
+        };
+        assert_ne!(request_fingerprint(other_procedure, &arguments, &principal, 7), original);
+        assert_ne!(request_fingerprint(header, &arguments, &Principal::Anonymous, 7), original);
+        assert_ne!(request_fingerprint(header, &arguments, &principal, 8), original, "the payload digest is seeded");
+        let small = &arguments[..FINGERPRINT_SHA256_PREFIX];
+        assert_eq!(
+            request_fingerprint(header, small, &principal, 7),
+            request_fingerprint(header, small, &principal, 8),
+            "arguments within the prefix are hashed with SHA-256 alone"
+        );
     }
 
     #[test]

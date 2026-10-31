@@ -154,13 +154,25 @@ reserve the record limit; every other reply fits a small fixed bound. A reply
 that would exceed its reservation is replaced by `SYSTEM_ERR`. Small metadata
 calls therefore never queue behind the byte budget of a maximum-size record.
 
+Clients send each call as one record fragment, so the fragment limit defaults
+to the record limit, and `build()` rejects limits whose fragment cannot hold a
+`max_write_size` WRITE call. A call over the record, fragment, or
+fragment-count limit is read to its end without being buffered and answered
+with `SYSTEM_ERR` on the same connection. Closing the connection instead would
+make a hard-mounted client reconnect and resend the call forever. Only broken
+framing, an empty non-final fragment, closes the connection.
+
 Replay and file-handle safety
 -----------------------------
 
 The old seen-XID tracker was replaced by a per-run reply cache for the
 non-idempotent NFSv3 procedures (SETATTR, WRITE, CREATE, MKDIR, SYMLINK, MKNOD,
-REMOVE, RMDIR, RENAME, and LINK). Its request fingerprint includes program,
-version, procedure, principal identity, and a digest of the arguments. Exact
+REMOVE, RMDIR, RENAME, and LINK). Its request fingerprint is a SHA-256 of the
+program, version, procedure, principal identity, argument length, and first
+KiB of the arguments; the remaining bytes, in practice WRITE data, enter it as
+an XXH3-128 digest under a per-run random seed. Every argument byte counts,
+and a 1 MiB WRITE is fingerprinted about 16 times faster than with SHA-256
+alone, even with SHA instructions. Exact
 in-flight duplicates wait; exact completed duplicates receive the cached bytes;
 a changed fingerprint is treated as XID reuse. Concurrent XID generations,
 cancellation, lost socket replies, capacity, TTL, and retained reply bytes are
@@ -340,8 +352,8 @@ Criterion benchmarks cover large RPC opaque values, zero-copy WRITE decoding,
 segmented READ reply assembly and replay cloning, fragmented record I/O,
 streaming READDIR encoding with truncation, full replay-cache hits,
 authenticated file-handle encoding and verification, and end-to-end loopback
-GETATTR, READ, and READDIRPLUS round trips, including many concurrent clients
-against a backend with latency. Run them with:
+GETATTR, READ, WRITE, and READDIRPLUS round trips, including many concurrent
+clients against a backend with latency. Run them with:
 
 ```sh
 cargo bench --bench performance

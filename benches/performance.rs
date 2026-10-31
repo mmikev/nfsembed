@@ -19,8 +19,9 @@ use nfsembed::rpc::codec::Decoder;
 use nfsembed::rpc::record::{read_record, write_record_limited, write_record_segments_limited, RecordLimits};
 use nfsembed::rpc::reply::EncodedReply;
 use nfsembed::vfs::{
-    CreatedObject, DirectoryEntry, ExportId, FileAttributes, FileType, NfsError, NfsName, NfsTime, ObjectKey,
-    ReadBytesResult, ReadDirectoryPage, RequestContext, VfsCapabilities, VirtualFileSystem,
+    CreatedObject, DirectoryEntry, ExportId, FileAttributes, FileType, MutationResult, NfsError, NfsName, NfsTime,
+    ObjectKey, ReadBytesResult, ReadDirectoryPage, RequestContext, VfsCapabilities, VirtualFileSystem, WriteResult,
+    WriteStability,
 };
 use nfsembed::{NfsServer, ServerLimits};
 use tokio::io::AsyncWrite;
@@ -333,7 +334,8 @@ const BENCH_DIRECTORY_ENTRIES: u64 = 1024;
 
 /// In-memory backend for end-to-end request benchmarks. It serves a root
 /// directory with `BENCH_DIRECTORY_ENTRIES` children and one shared 1 MiB file
-/// whose reads are zero-copy slices, so the measured time is server overhead.
+/// whose reads are zero-copy slices and whose writes are discarded, so the
+/// measured time is server overhead.
 struct BenchVfs {
     data: Bytes,
     backend_latency: Duration,
@@ -403,6 +405,24 @@ impl VirtualFileSystem for BenchVfs {
             data: self.data.slice(start..end),
             eof: end == self.data.len(),
             attributes: Some(bench_attributes(BENCH_FILE)),
+        })
+    }
+
+    async fn write(
+        &self,
+        _context: &RequestContext,
+        _object: ObjectKey,
+        _offset: u64,
+        data: &[u8],
+        _requested: WriteStability,
+    ) -> Result<MutationResult<WriteResult>, NfsError> {
+        Ok(MutationResult {
+            value: WriteResult {
+                count: data.len() as u32,
+                committed: WriteStability::FileSync,
+            },
+            before: None,
+            after: Some(bench_attributes(BENCH_FILE)),
         })
     }
 
@@ -519,6 +539,13 @@ fn server_benchmarks(c: &mut Criterion) {
     readdirplus.write_u32(64 * 1024);
     readdirplus.write_u32(256 * 1024);
     let readdirplus = readdirplus.into_bytes();
+    let mut write = Encoder::new();
+    write.write_opaque(&file).unwrap();
+    write.write_u64(0);
+    write.write_u32(MIB as u32);
+    write.write_u32(2);
+    write.write_opaque(&vec![0x42; MIB]).unwrap();
+    let write = write.into_bytes();
 
     let mut group = c.benchmark_group("server");
     group.throughput(Throughput::Elements(1));
@@ -531,6 +558,10 @@ fn server_benchmarks(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(MIB as u64));
     group.bench_function("read_1mib_round_trip", |b| {
         b.iter(|| rt.block_on(bench_call(&mut stream, nfsembed::nfs3::types::PROGRAM, 6, black_box(&read))))
+    });
+    // A single-fragment record, as Linux sends it.
+    group.bench_function("write_1mib_round_trip", |b| {
+        b.iter(|| rt.block_on(bench_call(&mut stream, nfsembed::nfs3::types::PROGRAM, 7, black_box(&write))))
     });
     group.finish();
     drop(stream);
