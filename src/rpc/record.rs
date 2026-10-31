@@ -31,6 +31,8 @@ const LAST_FRAGMENT: u32 = 0x8000_0000;
 const MAX_WIRE_FRAGMENT_SIZE: usize = 0x7fff_ffff;
 /// An RPC message starts with its four-byte transaction ID.
 const XID_SIZE: usize = 4;
+/// The largest block read at a time while dropping a refused fragment.
+const SKIP_BLOCK_SIZE: usize = 8 * 1024;
 
 /// One record read by `read_record_budgeted`.
 #[derive(Debug)]
@@ -41,26 +43,26 @@ pub enum InboundRecord {
         record: Vec<u8>,
         budget: OwnedSemaphorePermit,
     },
-    /// A record that exceeded the record-size, fragment-size, or
-    /// fragment-count limit given by `reason`. It was read to its last
-    /// fragment and dropped, so the stream is at the next record and the call
-    /// can be rejected without closing the connection. `xid` is `None` only
-    /// for a record shorter than an XID.
-    Refused { xid: Option<u32>, reason: RecordError },
+    /// A single-fragment record over the limits. It was read and dropped, so
+    /// the stream is at the next record and the call can be rejected without
+    /// closing the connection. `xid` is `None` only for a record shorter than
+    /// an XID.
+    Refused { xid: Option<u32>, reason: RecordRefusal },
 }
 
-/// What `read_fragments` read.
-enum Fragments {
-    Complete(Vec<u8>),
-    Refused { xid: Option<u32>, reason: RecordError },
+/// Why `read_record_budgeted` refused a record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecordRefusal {
+    #[error("RPC fragment of {actual} bytes exceeds limit {limit}")]
+    FragmentTooLarge { actual: usize, limit: usize },
+    #[error("RPC record of {actual} bytes exceeds limit {limit}")]
+    RecordTooLarge { actual: usize, limit: usize },
 }
 
 pub async fn read_record<R: AsyncRead + Unpin>(reader: &mut R, limits: RecordLimits) -> Result<Vec<u8>, RecordError> {
     let header = reader.read_u32().await?;
-    match read_fragments(reader, header, limits, false).await? {
-        Fragments::Complete(record) => Ok(record),
-        Fragments::Refused { reason, .. } => Err(reason),
-    }
+    read_fragments(reader, header, limits).await
 }
 
 /// Reads a record while charging its byte budget before any fragment body is
@@ -72,12 +74,15 @@ pub async fn read_record<R: AsyncRead + Unpin>(reader: &mut R, limits: RecordLim
 /// size up front: a whole-record reservation prevents fragmented readers from
 /// holding partial reservations while waiting on each other.
 ///
-/// A record over the limits is refused instead of failing the stream.
-/// Clients resend a call whose connection closed before it was answered, so
-/// closing the connection over a call too large to accept would make a
-/// hard-mounted client reconnect and resend it forever. The refused record's
-/// bytes are read and dropped without being buffered or charged. An empty
-/// non-final fragment still fails the stream.
+/// A single-fragment record over the limits is refused instead of failing the
+/// stream. Clients resend a call whose connection closed before it was
+/// answered, so closing the connection over a call too large to accept would
+/// make a hard-mounted client reconnect and resend it forever. Kernel clients
+/// send each call as one fragment, and such a record is known to be too large
+/// from its first header, so it is read and dropped through a scratch block
+/// of at most `SKIP_BLOCK_SIZE` bytes without charging any budget. Every other
+/// violation, including any in a fragmented record, fails the stream as soon
+/// as it is seen.
 pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
     reader: &mut R,
     limits: RecordLimits,
@@ -87,9 +92,9 @@ pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
     let reservation = match fragment_length(header, limits, 0) {
         Ok(length) if header & LAST_FRAGMENT != 0 => length,
         Ok(_) => limits.max_record_size,
-        Err(RecordError::EmptyFragment) => return Err(RecordError::EmptyFragment),
-        Err(reason) => {
-            let xid = discard_fragments(reader, header, &[]).await?;
+        Err(error) => {
+            let reason = refusal(header, error)?;
+            let xid = skip_fragment(reader, (header & !LAST_FRAGMENT) as usize).await?;
             return Ok(InboundRecord::Refused { xid, reason });
         },
     };
@@ -100,10 +105,25 @@ pub async fn read_record_budgeted<R: AsyncRead + Unpin>(
         .acquire_many_owned(reservation)
         .await
         .map_err(|_| RecordError::BudgetClosed)?;
-    Ok(match read_fragments(reader, header, limits, true).await? {
-        Fragments::Complete(record) => InboundRecord::Accepted { record, budget: permit },
-        Fragments::Refused { xid, reason } => InboundRecord::Refused { xid, reason },
-    })
+    let record = read_fragments(reader, header, limits).await?;
+    Ok(InboundRecord::Accepted { record, budget: permit })
+}
+
+/// Returns why a record whose first fragment `header` failed validation with
+/// `error` is refused, or `error` if it is not a single fragment over a size
+/// limit and must fail the stream.
+fn refusal(header: u32, error: RecordError) -> Result<RecordRefusal, RecordError> {
+    if header & LAST_FRAGMENT == 0 {
+        return Err(error);
+    }
+    match error {
+        RecordError::FragmentTooLarge { actual, limit } => Ok(RecordRefusal::FragmentTooLarge { actual, limit }),
+        RecordError::RecordTooLarge { limit } => Ok(RecordRefusal::RecordTooLarge {
+            actual: (header & !LAST_FRAGMENT) as usize,
+            limit,
+        }),
+        error => Err(error),
+    }
 }
 
 /// Validates one fragment header against the per-fragment limit and the
@@ -128,79 +148,51 @@ fn fragment_length(header: u32, limits: RecordLimits, received: usize) -> Result
 }
 
 /// Reads the fragment bodies of one record, starting from an already-read
-/// first fragment header. A record that exceeds a limit fails, or with
-/// `refuse_oversized` is discarded to its last fragment and refused.
+/// first fragment header. A record that exceeds a limit fails as soon as the
+/// violation is seen.
 async fn read_fragments<R: AsyncRead + Unpin>(
     reader: &mut R,
     mut header: u32,
     limits: RecordLimits,
-    refuse_oversized: bool,
-) -> Result<Fragments, RecordError> {
+) -> Result<Vec<u8>, RecordError> {
     let mut record = Vec::new();
-    let mut fragments = 0;
-    loop {
-        let length = if fragments == limits.max_fragments {
-            Err(RecordError::TooManyFragments {
-                limit: limits.max_fragments,
-            })
-        } else {
-            fragment_length(header, limits, record.len())
-        };
-        let length = match length {
-            Ok(length) => length,
-            Err(reason) if refuse_oversized && !matches!(reason, RecordError::EmptyFragment) => {
-                let xid = discard_fragments(reader, header, &record).await?;
-                return Ok(Fragments::Refused { xid, reason });
-            },
-            Err(error) => return Err(error),
-        };
+    for fragment in 1..=limits.max_fragments {
+        let length = fragment_length(header, limits, record.len())?;
         let start = record.len();
         reserve_record(&mut record, start + length, limits.max_record_size)?;
         record.resize(start + length, 0);
         reader.read_exact(&mut record[start..]).await?;
         if header & LAST_FRAGMENT != 0 {
-            return Ok(Fragments::Complete(record));
+            return Ok(record);
         }
-        fragments += 1;
-        if fragments == limits.max_fragments && !refuse_oversized {
+        if fragment == limits.max_fragments {
             // Fail without waiting for a header that may never arrive.
-            return Err(RecordError::TooManyFragments {
-                limit: limits.max_fragments,
-            });
+            break;
         }
         header = reader.read_u32().await?;
     }
+    Err(RecordError::TooManyFragments {
+        limit: limits.max_fragments,
+    })
 }
 
-/// Reads and drops the rest of a record, starting with the unread body of
-/// fragment `header`, and returns the record's XID. `received` holds the
-/// record bytes read before it.
-async fn discard_fragments<R: AsyncRead + Unpin>(
-    reader: &mut R,
-    mut header: u32,
-    received: &[u8],
-) -> Result<Option<u32>, RecordError> {
+/// Reads and drops one fragment body of `length` bytes and returns the XID
+/// in its first bytes. Only the XID and one bounded scratch block are held.
+async fn skip_fragment<R: AsyncRead + Unpin>(reader: &mut R, length: usize) -> Result<Option<u32>, RecordError> {
     let mut xid = [0; XID_SIZE];
-    let mut xid_length = received.len().min(XID_SIZE);
-    xid[..xid_length].copy_from_slice(&received[..xid_length]);
-    loop {
-        let mut length = (header & !LAST_FRAGMENT) as usize;
-        if length == 0 && header & LAST_FRAGMENT == 0 {
-            return Err(RecordError::EmptyFragment);
-        }
-        let xid_part = length.min(XID_SIZE - xid_length);
-        reader.read_exact(&mut xid[xid_length..xid_length + xid_part]).await?;
-        xid_length += xid_part;
-        length -= xid_part;
-        let mut body = (&mut *reader).take(length as u64);
-        if tokio::io::copy(&mut body, &mut tokio::io::sink()).await? < length as u64 {
+    let xid_length = length.min(XID_SIZE);
+    reader.read_exact(&mut xid[..xid_length]).await?;
+    let mut remaining = length - xid_length;
+    let mut scratch = vec![0; remaining.min(SKIP_BLOCK_SIZE)];
+    while remaining > 0 {
+        let block = remaining.min(scratch.len());
+        let read = reader.read(&mut scratch[..block]).await?;
+        if read == 0 {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
-        if header & LAST_FRAGMENT != 0 {
-            return Ok((xid_length == XID_SIZE).then(|| u32::from_be_bytes(xid)));
-        }
-        header = reader.read_u32().await?;
+        remaining -= read;
     }
+    Ok((xid_length == XID_SIZE).then(|| u32::from_be_bytes(xid)))
 }
 
 /// Grows geometrically for fragmented records while never requesting a
@@ -589,7 +581,7 @@ mod tests {
             refused,
             Ok(InboundRecord::Refused {
                 xid: Some(0xabab_abab),
-                reason: RecordError::FragmentTooLarge { actual: 33, limit: 32 },
+                reason: RecordRefusal::FragmentTooLarge { actual: 33, limit: 32 },
             })
         ));
         let empty = tokio::time::timeout(deadline, read_record_budgeted(&mut server, limits, exhausted))
@@ -599,42 +591,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn records_over_the_limits_are_refused_and_the_stream_stays_aligned() {
+    async fn single_fragment_records_over_the_limits_are_refused_and_the_stream_stays_aligned() {
         let limits = RecordLimits {
             max_record_size: 12,
             max_fragment_size: 8,
             max_fragments: 3,
         };
+        // A fragment limit above the record limit lets one fragment exceed
+        // only the record limit.
+        let wide = RecordLimits {
+            max_record_size: 8,
+            max_fragment_size: 12,
+            ..limits
+        };
         let budget = Arc::new(Semaphore::new(64));
         let (mut client, mut server) = tokio::io::duplex(1024);
-        // One fragment over the fragment limit, as Linux sends a WRITE.
+        // One fragment over the fragment limit, as Linux sends a WRITE, and
+        // one over the record limit. Skipping must also cross blocks.
         client.write_all(&0x8000_0009u32.to_be_bytes()).await.unwrap();
         client.write_all(&[0, 0, 0, 1, 9, 9, 9, 9, 9]).await.unwrap();
-        // Two fragments over the record limit.
-        client.write_all(&8u32.to_be_bytes()).await.unwrap();
-        client.write_all(&[0, 0, 0, 2, 8, 8, 8, 8]).await.unwrap();
-        client.write_all(&0x8000_0008u32.to_be_bytes()).await.unwrap();
-        client.write_all(&[8; 8]).await.unwrap();
-        // Four one-byte fragments; the XID ends in the one past the limit.
-        for (index, byte) in [0u8, 0, 0, 3].into_iter().enumerate() {
+        client.write_all(&0x8000_0009u32.to_be_bytes()).await.unwrap();
+        client.write_all(&[0, 0, 0, 2, 9, 9, 9, 9, 9]).await.unwrap();
+        client
+            .write_all(&(0x8000_0000u32 | (SKIP_BLOCK_SIZE as u32 * 2 + 1)).to_be_bytes())
+            .await
+            .unwrap();
+        // The skipped body is larger than the pipe, so it is written while
+        // the reader drains it.
+        let writer = tokio::spawn(async move {
+            client.write_all(&[0, 0, 0, 3]).await.unwrap();
+            client.write_all(&vec![7; SKIP_BLOCK_SIZE * 2 - 3]).await.unwrap();
+            client.write_all(&0x8000_0004u32.to_be_bytes()).await.unwrap();
+            client.write_all(b"next").await.unwrap();
             client
-                .write_all(&(1 | if index == 3 { 0x8000_0000u32 } else { 0 }).to_be_bytes())
-                .await
-                .unwrap();
-            client.write_all(&[byte]).await.unwrap();
-        }
-        client.write_all(&0x8000_0004u32.to_be_bytes()).await.unwrap();
-        client.write_all(b"next").await.unwrap();
+        });
 
-        for (expected_xid, expected_reason) in [
-            (1, RecordError::FragmentTooLarge { actual: 9, limit: 8 }),
-            (2, RecordError::RecordTooLarge { limit: 12 }),
-            (3, RecordError::TooManyFragments { limit: 3 }),
+        for (record_limits, expected_xid, expected_reason) in [
+            (limits, 1, RecordRefusal::FragmentTooLarge { actual: 9, limit: 8 }),
+            (wide, 2, RecordRefusal::RecordTooLarge { actual: 9, limit: 8 }),
+            (
+                limits,
+                3,
+                RecordRefusal::FragmentTooLarge {
+                    actual: SKIP_BLOCK_SIZE * 2 + 1,
+                    limit: 8,
+                },
+            ),
         ] {
-            match read_record_budgeted(&mut server, limits, budget.clone()).await.unwrap() {
+            match read_record_budgeted(&mut server, record_limits, budget.clone()).await.unwrap() {
                 InboundRecord::Refused { xid, reason } => {
                     assert_eq!(xid, Some(expected_xid));
-                    assert_eq!(reason.to_string(), expected_reason.to_string());
+                    assert_eq!(reason, expected_reason);
                 },
                 InboundRecord::Accepted { record, .. } => panic!("record {record:?} was accepted"),
             }
@@ -643,9 +650,10 @@ mod tests {
         let (record, permit) = accepted(read_record_budgeted(&mut server, limits, budget.clone()).await.unwrap());
         assert_eq!(record, b"next");
         drop(permit);
+        let mut client = writer.await.unwrap();
 
-        // A refused record too short to carry an XID, then a stream that
-        // ends inside a refused record.
+        // A refused record too short to carry an XID, then streams that end
+        // inside a refused record's body and inside its XID.
         let tiny = RecordLimits {
             max_record_size: 2,
             max_fragment_size: 2,
@@ -654,16 +662,67 @@ mod tests {
         client.write_all(&0x8000_0003u32.to_be_bytes()).await.unwrap();
         client.write_all(b"abc").await.unwrap();
         client.write_all(&0x8000_0009u32.to_be_bytes()).await.unwrap();
-        client.write_all(b"ab").await.unwrap();
+        client.write_all(b"abcdef").await.unwrap();
         drop(client);
         assert!(matches!(
             read_record_budgeted(&mut server, tiny, budget.clone()).await,
             Ok(InboundRecord::Refused { xid: None, .. })
         ));
         assert!(matches!(
+            read_record_budgeted(&mut server, tiny, budget.clone()).await,
+            Err(RecordError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
+        ));
+        let (mut client, mut server) = tokio::io::duplex(16);
+        client.write_all(&0x8000_0009u32.to_be_bytes()).await.unwrap();
+        client.write_all(b"ab").await.unwrap();
+        drop(client);
+        assert!(matches!(
             read_record_budgeted(&mut server, tiny, budget).await,
             Err(RecordError::Io(error)) if error.kind() == io::ErrorKind::UnexpectedEof
         ));
+    }
+
+    #[tokio::test]
+    async fn fragmented_records_over_the_limits_fail_without_waiting_for_more_input() {
+        let limits = RecordLimits {
+            max_record_size: 12,
+            max_fragment_size: 8,
+            max_fragments: 3,
+        };
+        let budget = Arc::new(Semaphore::new(64));
+        let mut first_fragment_too_large = Vec::new();
+        first_fragment_too_large.extend_from_slice(&9u32.to_be_bytes());
+        first_fragment_too_large.extend_from_slice(&[0, 0, 0, 1, 9]);
+        let mut record_too_large = Vec::new();
+        record_too_large.extend_from_slice(&8u32.to_be_bytes());
+        record_too_large.extend_from_slice(&[0, 0, 0, 2, 8, 8, 8, 8]);
+        record_too_large.extend_from_slice(&0x8000_0008u32.to_be_bytes());
+        let mut too_many_fragments = Vec::new();
+        for byte in [0, 0, 3] {
+            too_many_fragments.extend_from_slice(&1u32.to_be_bytes());
+            too_many_fragments.push(byte);
+        }
+
+        for (input, expected) in [
+            (first_fragment_too_large, RecordError::FragmentTooLarge { actual: 9, limit: 8 }),
+            (record_too_large, RecordError::RecordTooLarge { limit: 12 }),
+            (too_many_fragments, RecordError::TooManyFragments { limit: 3 }),
+        ] {
+            // The client stays connected and sends nothing more, so a reader
+            // that waited for the rest of the record would time out.
+            let (mut client, mut server) = tokio::io::duplex(1024);
+            client.write_all(&input).await.unwrap();
+            let error = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                read_record_budgeted(&mut server, limits, budget.clone()),
+            )
+            .await
+            .expect("a framing violation must fail without more input")
+            .unwrap_err();
+            assert_eq!(error.to_string(), expected.to_string());
+            assert_eq!(budget.available_permits(), 64, "a failed record returns its budget");
+            drop(client);
+        }
     }
 
     #[tokio::test]

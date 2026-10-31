@@ -366,7 +366,11 @@ fn bench_attributes(object: ObjectKey) -> FileAttributes {
 #[async_trait]
 impl VirtualFileSystem for BenchVfs {
     fn capabilities(&self) -> VfsCapabilities {
-        VfsCapabilities::READ_ONLY
+        // Writable, but without links, special files, or settable times.
+        VfsCapabilities {
+            read_only: false,
+            ..VfsCapabilities::READ_ONLY
+        }
     }
 
     fn root(&self) -> ObjectKey {

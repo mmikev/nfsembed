@@ -1271,7 +1271,7 @@ async fn default_limits_accept_a_maximum_size_write_sent_as_one_fragment() {
 }
 
 #[tokio::test]
-async fn refused_records_get_system_err_and_hostile_framing_closes_only_its_connection() {
+async fn oversized_single_fragment_calls_get_system_err_and_other_violations_close_only_their_connection() {
     let mut limits = ServerLimits::production_defaults();
     limits.max_rpc_fragment_size = 1024;
     limits.max_rpc_record_size = 2048;
@@ -1285,8 +1285,9 @@ async fn refused_records_get_system_err_and_hostile_framing_closes_only_its_conn
     let root = mount_root(&mut client, b"/").await;
     let file = lookup_handle(&mut client, &root, b"file").await;
 
-    // A WRITE over the fragment limit is answered on its connection, so a
-    // client fails it instead of reconnecting to resend it.
+    // A WRITE over the fragment limit, sent as one fragment as kernel clients
+    // send every call, is answered on its connection, so a client fails it
+    // instead of reconnecting to resend it.
     let writes = vfs.call_count("write");
     let oversized = write_arguments(&file, &[7; 1000]);
     for _ in 0..3 {
@@ -1307,42 +1308,49 @@ async fn refused_records_get_system_err_and_hostile_framing_closes_only_its_conn
         0,
     );
 
-    // So is a call in more fragments than allowed.
+    // Every other limit violation, and broken framing, closes only its own
+    // connection, as soon as it is seen rather than when the record ends.
     let call = rpc_call(801, 2, NFS_PROGRAM, NFS_VERSION, 0, &[], &Auth::Sys);
-    let mut fragments = Vec::new();
+    let mut too_many_fragments = Vec::new();
     for (index, chunk) in call.chunks(call.len().div_ceil(4)).enumerate() {
-        fragments.extend_from_slice(&record_header(chunk.len(), index == 3));
-        fragments.extend_from_slice(chunk);
+        too_many_fragments.extend_from_slice(&record_header(chunk.len(), index == 3));
+        too_many_fragments.extend_from_slice(chunk);
     }
-    client.write_raw(&fragments).await;
-    assert!(matches!(
-        client.read_reply().await,
-        RpcOutcome::Accepted {
-            xid: 801,
-            status: 5,
-            ..
+    let mut unfinished = Vec::new();
+    for value in [1u8, 2, 3, 4] {
+        unfinished.extend_from_slice(&record_header(1, false));
+        unfinished.push(value);
+    }
+    let mut first_fragment_too_large = record_header(1025, false).to_vec();
+    first_fragment_too_large.extend_from_slice(&[0; 1025]);
+    let mut record_too_large = Vec::new();
+    for last in [false, false, true] {
+        record_too_large.extend_from_slice(&record_header(1000, last));
+        record_too_large.extend_from_slice(&[0; 1000]);
+    }
+    let mut truncated = record_header(4096, true).to_vec();
+    truncated.extend_from_slice(&[0; 100]);
+    for (violation, bytes, end_stream) in [
+        ("too many fragments", too_many_fragments, false),
+        ("unfinished record past the fragment count", unfinished, false),
+        ("first of several fragments over the fragment limit", first_fragment_too_large, false),
+        ("fragments over the record limit", record_too_large, false),
+        ("empty non-final fragment", record_header(0, false).to_vec(), false),
+        ("stream ending inside a refused record", truncated, true),
+    ] {
+        let mut stream = TcpStream::connect(server.address).await.unwrap();
+        stream.write_all(&bytes).await.unwrap();
+        if end_stream {
+            stream.shutdown().await.unwrap();
         }
-    ));
+        let mut byte = [0];
+        let result = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+            .await
+            .unwrap_or_else(|_| panic!("{violation}: the connection stayed open"));
+        assert!(matches!(result, Ok(0) | Err(_)), "{violation}: the server replied");
+    }
     let (status, _) = client.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();
     assert_eq!(status, 0);
-
-    // An empty non-final fragment, or a stream that ends inside a refused
-    // record, closes only its own connection.
-    let mut byte = [0];
-    let mut empty = TcpStream::connect(server.address).await.unwrap();
-    empty.write_all(&record_header(0, false)).await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(1), empty.read(&mut byte))
-        .await
-        .unwrap();
-    assert!(matches!(result, Ok(0) | Err(_)));
-    let mut truncated = TcpStream::connect(server.address).await.unwrap();
-    truncated.write_all(&record_header(4096, true)).await.unwrap();
-    truncated.write_all(&[0; 100]).await.unwrap();
-    truncated.shutdown().await.unwrap();
-    let result = tokio::time::timeout(Duration::from_secs(1), truncated.read(&mut byte))
-        .await
-        .unwrap();
-    assert!(matches!(result, Ok(0) | Err(_)));
 
     let mut healthy = RpcClient::connect(server.address).await;
     let (status, payload) = healthy.call(NFS_PROGRAM, NFS_VERSION, 0, &[]).await.accepted();

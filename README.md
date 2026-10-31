@@ -155,12 +155,21 @@ that would exceed its reservation is replaced by `SYSTEM_ERR`. Small metadata
 calls therefore never queue behind the byte budget of a maximum-size record.
 
 Clients send each call as one record fragment, so the fragment limit defaults
-to the record limit, and `build()` rejects limits whose fragment cannot hold a
-`max_write_size` WRITE call. A call over the record, fragment, or
-fragment-count limit is read to its end without being buffered and answered
-with `SYSTEM_ERR` on the same connection. Closing the connection instead would
-make a hard-mounted client reconnect and resend the call forever. Only broken
-framing, an empty non-final fragment, closes the connection.
+to the same 2 MiB as the record limit, and `build()` rejects limits whose
+fragment cannot hold a `max_write_size` WRITE call. A call sent as one fragment over the fragment or
+record limit is read and dropped without being buffered or charged to the
+request budget, and is answered with `SYSTEM_ERR` on the same connection.
+Closing the connection instead would make a hard-mounted client reconnect and
+resend the call forever. The first such refusal on a connection is logged as a
+warning and later ones at debug level. A fragmented record that breaks any
+limit, and broken framing such as an empty non-final fragment, close the
+connection as soon as the violation is seen.
+
+Because the fragment limit caps every call, not only WRITE, a limit far below
+the default also refuses other long calls, such as a SYMLINK with a long
+target (Linux allows 4 KiB), a MOUNT of a long path, or a RENAME of two long
+names under a large AUTH_SYS credential. The default holds every call a kernel
+client sends; keep the fragment limit at 8 KiB or more to stay clear of them.
 
 Replay and file-handle safety
 -----------------------------
@@ -172,11 +181,10 @@ program, version, procedure, principal identity, argument length, and first
 KiB of the arguments; the remaining bytes, in practice WRITE data, enter it as
 an XXH3-128 digest under a per-run random seed. Every argument byte counts,
 and a 1 MiB WRITE is fingerprinted about 16 times faster than with SHA-256
-alone, even with SHA instructions. Exact
-in-flight duplicates wait; exact completed duplicates receive the cached bytes;
-a changed fingerprint is treated as XID reuse. Concurrent XID generations,
-cancellation, lost socket replies, capacity, TTL, and retained reply bytes are
-all handled explicitly.
+alone, even with SHA instructions. Exact in-flight duplicates wait; exact
+completed duplicates receive the cached bytes; a changed fingerprint is
+treated as XID reuse. Concurrent XID generations, cancellation, lost socket
+replies, capacity, TTL, and retained reply bytes are all handled explicitly.
 
 Idempotent calls (reads, lookups, attribute and filesystem queries, COMMIT,
 MOUNT, and portmapper) are executed again when retransmitted, as in other NFS
@@ -240,6 +248,21 @@ Applications moving from the upstream version should:
    demo API and its `demo` feature have been removed, and there is no automatic
    adapter. `examples/mirrorfs.rs` is a complete host-filesystem backend on the
    production contract.
+
+Applications upgrading from 0.2 should:
+
+1. Check hand-built `ServerLimits`. `build()` now fails with "a max_write_size
+   WRITE call must fit in one RPC fragment" for limits such as the 0.2 defaults
+   of a 1 MiB fragment with 1 MiB writes; raise `max_rpc_fragment_size` or
+   lower `max_write_size`. `max_rpc_fragment_size` now defaults to 2 MiB, the
+   same as `max_rpc_record_size`, so limits that lower only the record limit
+   fail with "RPC record limit must be at least the non-zero fragment limit";
+   lower the fragment limit with it.
+2. Match on the `InboundRecord` that `rpc::record::read_record_budgeted` now
+   returns instead of a record and permit. `Refused` carries a `RecordRefusal`
+   and the call's XID, when the record is long enough to hold one; the record
+   has been dropped and the stream is at the next record, so the call can be
+   answered with an error.
 
 Usage
 =====

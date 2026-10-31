@@ -28,7 +28,10 @@ pub struct ServerLimits {
     pub max_rpc_record_size: usize,
     /// The largest record fragment accepted or sent. Clients send each call
     /// as a single fragment, so this also bounds the largest call: it must
-    /// hold a `max_write_size` WRITE.
+    /// hold a `max_write_size` WRITE, and any other call over it, such as a
+    /// SYMLINK with a long target under a small limit, is answered with
+    /// `SYSTEM_ERR`. At 8 KiB or more it holds every other NFSv3 or MOUNT
+    /// call a kernel client sends.
     pub max_rpc_fragment_size: usize,
     pub max_fragments_per_record: usize,
     pub max_buffered_request_bytes: usize,
